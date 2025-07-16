@@ -32,14 +32,36 @@ except Exception as e:
     logger.error(f"Line Bot API 初始化失敗: {e}")
     raise
 
-# 本地 Whisper 模型設定
-# 加載 Whisper Large v2 模型 (免費開源)
-try:
-    whisper_model = whisper.load_model("large-v2")
-    logger.info("本地 Whisper Large v2 模型加載成功")
-except Exception as e:
-    logger.error(f"Whisper 模型加載失敗: {e}")
-    whisper_model = None憑證
+# 本地 Whisper 模型設定 (自動選擇適合的模型大小)
+# 優先使用小模型以適應雲端部署環境
+whisper_model = None
+WHISPER_MODEL_SIZE = os.getenv('WHISPER_MODEL_SIZE', 'tiny')  # 預設使用 tiny 模型(適合雲端部署)
+
+def load_whisper_model():
+    """延遲加載 Whisper 模型以優化啟動時間"""
+    global whisper_model
+    if whisper_model is not None:
+        return whisper_model
+    
+    try:
+        logger.info(f"正在加載 Whisper {WHISPER_MODEL_SIZE} 模型...")
+        whisper_model = whisper.load_model(WHISPER_MODEL_SIZE)
+        logger.info(f"Whisper {WHISPER_MODEL_SIZE} 模型加載成功")
+        return whisper_model
+    except Exception as e:
+        logger.error(f"Whisper 模型加載失敗: {e}")
+        try:
+            logger.info("嘗試加載 tiny 模型作為備用...")
+            whisper_model = whisper.load_model("tiny")
+            logger.info("Whisper tiny 模型加載成功")
+            return whisper_model
+        except Exception as e2:
+            logger.error(f"備用模型也加載失敗: {e2}")
+            whisper_model = None
+            return None
+
+# 在應用啟動時不立即加載模型，等到需要時再加載
+logger.info("應用啟動成功，將在首次語音轉錄時加載 Whisper 模型")憑證
 
 # 用戶狀態管理
 user_sessions = {}
@@ -242,16 +264,19 @@ def split_audio_for_whisper(audio_data, chunk_size_mb=50):
 
 def transcribe_audio_with_local_whisper(audio_data):
     """
-    使用本地 Whisper Large v2 模型轉錄音檔
-    完全免費，無需 API 金鑰
+    使用本地 Whisper 模型轉錄音檔
+    自動選擇適合的模型大小，完全免費
     """
     try:
-        if not whisper_model:
-            logger.error("Whisper 模型未加載")
+        # 延遲加載模型
+        model = load_whisper_model()
+        if not model:
+            logger.error("Whisper 模型加載失敗")
             return None
         
-        # 分割音檔 (本地處理可以處理更大的檔案)
-        audio_chunks = split_audio_for_whisper(audio_data, chunk_size_mb=50)
+        # 根據模型大小調整分割策略(雲端部署優化)
+        chunk_size = 15 if WHISPER_MODEL_SIZE == 'tiny' else 20
+        audio_chunks = split_audio_for_whisper(audio_data, chunk_size_mb=chunk_size)
         
         transcriptions = []
         
@@ -266,7 +291,7 @@ def transcribe_audio_with_local_whisper(audio_data):
                 
                 try:
                     # 使用本地 Whisper 模型轉錄
-                    result = whisper_model.transcribe(
+                    result = model.transcribe(
                         temp_file_path,
                         language="zh",  # 中文
                         task="transcribe",
@@ -447,7 +472,7 @@ def handle_text_message(event):
 4. 輸入 /end 儲存到試算表
 
 ✨ 支援功能：
-• 語音轉文字（使用本地 Whisper Large v2）
+• 語音轉文字（使用本地 Whisper AI）
 • 大音檔自動分割處理
 • 即時對話累積
 • Google Sheets 自動儲存"""
