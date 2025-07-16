@@ -1,7 +1,7 @@
 from flask import Flask, request, abort, jsonify
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
-from linebot.models import MessageEvent, TextMessage, TextSendMessage
+from linebot.models import MessageEvent, TextMessage, AudioMessage, TextSendMessage
 import os
 import logging
 import gspread
@@ -9,6 +9,10 @@ from google.auth.credentials import Credentials
 from google.oauth2.service_account import Credentials as ServiceAccountCredentials
 from datetime import datetime
 import json
+import tempfile
+import openai
+from pydub import AudioSegment
+import io
 
 # 設定日誌記錄
 logging.basicConfig(
@@ -27,6 +31,38 @@ try:
 except Exception as e:
     logger.error(f"Line Bot API 初始化失敗: {e}")
     raise
+
+# OpenAI 設定
+openai.api_key = os.getenv('OPENAI_API_KEY')
+
+# 用戶狀態管理
+user_sessions = {}
+user_conversations = {}
+
+class UserSession:
+    def __init__(self, user_id):
+        self.user_id = user_id
+        self.is_recording = False  # 是否正在錄音模式
+        self.conversation_buffer = []  # 對話緩衝區
+        self.created_at = datetime.now()
+    
+    def start_recording(self):
+        self.is_recording = True
+        self.conversation_buffer = []
+        logger.info(f"用戶 {self.user_id} 開始錄音模式")
+    
+    def stop_recording(self):
+        self.is_recording = False
+        logger.info(f"用戶 {self.user_id} 停止錄音模式")
+    
+    def add_message(self, message):
+        self.conversation_buffer.append({
+            'timestamp': datetime.now(),
+            'content': message
+        })
+    
+    def get_conversation_text(self):
+        return '\n'.join([msg['content'] for msg in self.conversation_buffer])
 
 # Google Sheets 設定
 GOOGLE_SHEETS_ID = os.getenv('GOOGLE_SHEETS_ID')
@@ -143,6 +179,13 @@ def initialize_google_sheets():
         return None
 
 
+def get_user_session(user_id):
+    """取得或建立用戶會話"""
+    if user_id not in user_sessions:
+        user_sessions[user_id] = UserSession(user_id)
+    return user_sessions[user_id]
+
+
 def get_user_display_name(user_id):
     """取得用戶顯示名稱"""
     try:
@@ -151,6 +194,92 @@ def get_user_display_name(user_id):
     except Exception as e:
         logger.warning(f"無法取得用戶 {user_id} 的顯示名稱: {e}")
         return "未知用戶"
+
+
+def split_audio_for_whisper(audio_data, chunk_size_mb=20):
+    """
+    將音檔分割成適合 Whisper API 的大小
+    Whisper API 限制檔案大小為 25MB
+    """
+    try:
+        # 將音檔載入 AudioSegment
+        audio = AudioSegment.from_file(io.BytesIO(audio_data))
+        
+        # 估算每個 chunk 的長度（毫秒）
+        file_size_mb = len(audio_data) / (1024 * 1024)
+        if file_size_mb <= chunk_size_mb:
+            return [audio_data]  # 檔案夠小，不需要分割
+        
+        # 計算需要分割的數量
+        num_chunks = int(file_size_mb / chunk_size_mb) + 1
+        chunk_duration = len(audio) // num_chunks
+        
+        chunks = []
+        for i in range(num_chunks):
+            start = i * chunk_duration
+            end = start + chunk_duration if i < num_chunks - 1 else len(audio)
+            
+            chunk = audio[start:end]
+            
+            # 將 chunk 轉換為 bytes
+            with io.BytesIO() as buffer:
+                chunk.export(buffer, format="mp3")
+                chunks.append(buffer.getvalue())
+        
+        logger.info(f"音檔分割為 {len(chunks)} 個片段")
+        return chunks
+        
+    except Exception as e:
+        logger.error(f"音檔分割失敗: {e}")
+        return [audio_data]  # 分割失敗，返回原檔案
+
+
+def transcribe_audio_with_whisper(audio_data):
+    """
+    使用 Whisper API 轉錄音檔
+    支援大檔案分割處理
+    """
+    try:
+        # 分割音檔
+        audio_chunks = split_audio_for_whisper(audio_data)
+        
+        transcriptions = []
+        
+        for i, chunk in enumerate(audio_chunks):
+            logger.info(f"正在轉錄第 {i+1}/{len(audio_chunks)} 個音檔片段")
+            
+            # 建立臨時檔案
+            with tempfile.NamedTemporaryFile(suffix='.mp3', delete=False) as temp_file:
+                temp_file.write(chunk)
+                temp_file_path = temp_file.name
+            
+            try:
+                # 使用 Whisper API 轉錄
+                with open(temp_file_path, 'rb') as audio_file:
+                    response = openai.Audio.transcribe(
+                        model="whisper-1",
+                        file=audio_file,
+                        language="zh"  # 指定中文
+                    )
+                
+                transcription = response.text.strip()
+                if transcription:
+                    transcriptions.append(transcription)
+                    logger.info(f"第 {i+1} 個片段轉錄成功: {transcription[:50]}...")
+                
+            finally:
+                # 清理臨時檔案
+                os.unlink(temp_file_path)
+        
+        # 合併所有轉錄結果
+        full_transcription = ' '.join(transcriptions)
+        logger.info(f"音檔轉錄完成，總長度: {len(full_transcription)} 字元")
+        
+        return full_transcription
+        
+    except Exception as e:
+        logger.error(f"Whisper API 轉錄失敗: {e}")
+        return None
 
 
 def save_message_to_sheets(user_id, user_name, message_text):
@@ -245,24 +374,72 @@ def handle_text_message(event):
     """處理文字訊息事件"""
     try:
         user_id = event.source.user_id
-        message_text = event.message.text
+        message_text = event.message.text.strip()
         
         logger.info(f"收到文字訊息 - 用戶: {user_id}, 訊息: {message_text[:100]}...")
         
-        # 取得用戶顯示名稱
+        # 取得用戶會話和顯示名稱
+        session = get_user_session(user_id)
         user_name = get_user_display_name(user_id)
         
-        # 立即儲存訊息到 Google Sheets
-        save_success = save_message_to_sheets(user_id, user_name, message_text)
+        # 處理指令
+        if message_text == '/save':
+            session.start_recording()
+            reply_text = "🎙️ 開始會議記錄模式！\n\n現在您可以：\n📝 發送文字訊息\n🎤 發送語音訊息\n\n所有內容都會累積顯示，輸入 /end 結束並儲存到 Google Sheets。"
         
-        if save_success:
-            reply_text = "✅ 您的訊息已成功儲存到 Google Sheets！"
-            logger.info(f"成功處理用戶 {user_name} 的訊息")
+        elif message_text == '/end':
+            if session.is_recording and session.conversation_buffer:
+                # 儲存到 Google Sheets
+                conversation_text = session.get_conversation_text()
+                save_success = save_message_to_sheets(user_id, user_name, conversation_text)
+                
+                if save_success:
+                    reply_text = f"✅ 會議記錄已儲存到 Google Sheets！\n\n📄 總共記錄了 {len(session.conversation_buffer)} 條內容\n📊 總字數約 {len(conversation_text)} 字元"
+                else:
+                    reply_text = "❌ 儲存失敗，請稍後再試。"
+                
+                session.stop_recording()
+            else:
+                reply_text = "❌ 目前沒有進行中的會議記錄。\n\n請先輸入 /save 開始記錄模式。"
+        
+        elif message_text == '/status':
+            if session.is_recording:
+                conversation_text = session.get_conversation_text()
+                reply_text = f"📊 會議記錄狀態：進行中\n\n📝 已記錄 {len(session.conversation_buffer)} 條內容\n📄 目前內容:\n\n{conversation_text[:500]}{'...' if len(conversation_text) > 500 else ''}\n\n輸入 /end 結束並儲存"
+            else:
+                reply_text = "📊 會議記錄狀態：未開始\n\n輸入 /save 開始記錄模式"
+        
+        elif message_text == '/help':
+            reply_text = """📖 會議記錄小幫手使用說明：
+
+🎙️ /save - 開始會議記錄模式
+⏹️ /end - 結束記錄並儲存到 Google Sheets
+📊 /status - 查看目前記錄狀態
+📖 /help - 顯示此說明
+
+💡 使用方式：
+1. 輸入 /save 開始記錄
+2. 發送語音或文字訊息
+3. 所有內容會累積顯示
+4. 輸入 /end 儲存到試算表
+
+✨ 支援功能：
+• 語音轉文字（使用 Whisper AI）
+• 大音檔自動分割處理
+• 即時對話累積
+• Google Sheets 自動儲存"""
+        
         else:
-            reply_text = "❌ 抱歉，訊息儲存失敗，請稍後再試。"
-            logger.error(f"儲存用戶 {user_name} 的訊息失敗")
+            # 一般文字訊息
+            if session.is_recording:
+                session.add_message(message_text)
+                conversation_text = session.get_conversation_text()
+                
+                reply_text = f"📝 已記錄文字訊息\n\n💬 目前累積內容:\n\n{conversation_text}\n\n📊 共 {len(session.conversation_buffer)} 條記錄 | 輸入 /end 結束並儲存"
+            else:
+                reply_text = f"收到您的訊息：{message_text}\n\n💡 提示：輸入 /save 開始會議記錄模式，或輸入 /help 查看使用說明。"
         
-        # 回覆確認訊息
+        # 回覆訊息
         line_bot_api.reply_message(
             event.reply_token,
             TextSendMessage(text=reply_text)
@@ -279,17 +456,76 @@ def handle_text_message(event):
             pass
 
 
+@handler.add(MessageEvent, message=AudioMessage)
+def handle_audio_message(event):
+    """處理語音訊息事件"""
+    try:
+        user_id = event.source.user_id
+        
+        logger.info(f"收到語音訊息 - 用戶: {user_id}")
+        
+        # 取得用戶會話和顯示名稱
+        session = get_user_session(user_id)
+        user_name = get_user_display_name(user_id)
+        
+        if not session.is_recording:
+            reply_text = "🎤 收到語音訊息！\n\n💡 提示：輸入 /save 開始會議記錄模式，語音將自動轉為文字並累積顯示。\n\n或輸入 /help 查看使用說明。"
+            line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(text=reply_text)
+            )
+            return
+        
+        # 下載音檔
+        message_content = line_bot_api.get_message_content(event.message.id)
+        audio_data = message_content.content
+        
+        # 先回覆處理中訊息
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(text="🎤 正在處理語音訊息，請稍候...\n\n⏳ 使用 Whisper AI 轉錄中...")
+        )
+        
+        # 使用 Whisper API 轉錄
+        transcription = transcribe_audio_with_whisper(audio_data)
+        
+        if transcription:
+            # 加入對話記錄
+            session.add_message(f"[語音] {transcription}")
+            conversation_text = session.get_conversation_text()
+            
+            # 推送結果訊息
+            result_text = f"🎤 語音轉錄完成！\n\n📝 轉錄內容:\n{transcription}\n\n💬 目前累積內容:\n\n{conversation_text}\n\n📊 共 {len(session.conversation_buffer)} 條記錄 | 輸入 /end 結束並儲存"
+        else:
+            result_text = "❌ 語音轉錄失敗，請重新發送或檢查音檔格式。"
+        
+        # 推送結果（因為已經回覆過，這裡使用 push_message）
+        line_bot_api.push_message(
+            user_id,
+            TextSendMessage(text=result_text)
+        )
+        
+    except Exception as e:
+        logger.error(f"處理語音訊息時發生錯誤: {e}")
+        try:
+            line_bot_api.push_message(
+                user_id,
+                TextSendMessage(text="❌ 語音處理失敗，請稍後再試。")
+            )
+        except:
+            pass
+
+
 @handler.add(MessageEvent)
 def handle_other_message(event):
-    """處理非文字訊息（圖片、貼圖等）"""
+    """處理其他類型訊息（圖片、貼圖等）"""
     try:
         user_id = event.source.user_id
         user_name = get_user_display_name(user_id)
         
-        logger.info(f"收到非文字訊息 - 用戶: {user_name}, 訊息類型: {type(event.message).__name__}")
+        logger.info(f"收到其他類型訊息 - 用戶: {user_name}, 訊息類型: {type(event.message).__name__}")
         
-        # 忽略非文字訊息，只回覆提示
-        reply_text = "📝 此 Bot 只處理文字訊息，其他類型的訊息將被忽略。"
+        reply_text = "📱 此會議記錄小幫手只處理文字和語音訊息。\n\n💡 支援功能：\n🎤 語音轉文字\n📝 文字記錄\n📊 Google Sheets 儲存\n\n輸入 /help 查看使用說明"
         
         line_bot_api.reply_message(
             event.reply_token,
@@ -297,7 +533,7 @@ def handle_other_message(event):
         )
         
     except Exception as e:
-        logger.error(f"處理非文字訊息時發生錯誤: {e}")
+        logger.error(f"處理其他訊息時發生錯誤: {e}")
 
 
 if __name__ == "__main__":
