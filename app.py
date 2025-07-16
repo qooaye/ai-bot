@@ -10,7 +10,7 @@ from google.oauth2.service_account import Credentials as ServiceAccountCredentia
 from datetime import datetime
 import json
 import tempfile
-import openai
+import whisper
 from pydub import AudioSegment
 import io
 
@@ -32,8 +32,14 @@ except Exception as e:
     logger.error(f"Line Bot API 初始化失敗: {e}")
     raise
 
-# OpenAI 設定
-openai.api_key = os.getenv('OPENAI_API_KEY')
+# 本地 Whisper 模型設定
+# 加載 Whisper Large v2 模型 (免費開源)
+try:
+    whisper_model = whisper.load_model("large-v2")
+    logger.info("本地 Whisper Large v2 模型加載成功")
+except Exception as e:
+    logger.error(f"Whisper 模型加載失敗: {e}")
+    whisper_model = None憑證
 
 # 用戶狀態管理
 user_sessions = {}
@@ -196,10 +202,10 @@ def get_user_display_name(user_id):
         return "未知用戶"
 
 
-def split_audio_for_whisper(audio_data, chunk_size_mb=20):
+def split_audio_for_whisper(audio_data, chunk_size_mb=50):
     """
-    將音檔分割成適合 Whisper API 的大小
-    Whisper API 限制檔案大小為 25MB
+    將音檔分割成適合本地 Whisper 處理的大小
+    本地處理可以處理更大的檔案，預設 50MB
     """
     try:
         # 將音檔載入 AudioSegment
@@ -234,51 +240,68 @@ def split_audio_for_whisper(audio_data, chunk_size_mb=20):
         return [audio_data]  # 分割失敗，返回原檔案
 
 
-def transcribe_audio_with_whisper(audio_data):
+def transcribe_audio_with_local_whisper(audio_data):
     """
-    使用 Whisper API 轉錄音檔
-    支援大檔案分割處理
+    使用本地 Whisper Large v2 模型轉錄音檔
+    完全免費，無需 API 金鑰
     """
     try:
-        # 分割音檔
-        audio_chunks = split_audio_for_whisper(audio_data)
+        if not whisper_model:
+            logger.error("Whisper 模型未加載")
+            return None
+        
+        # 分割音檔 (本地處理可以處理更大的檔案)
+        audio_chunks = split_audio_for_whisper(audio_data, chunk_size_mb=50)
         
         transcriptions = []
         
         for i, chunk in enumerate(audio_chunks):
             logger.info(f"正在轉錄第 {i+1}/{len(audio_chunks)} 個音檔片段")
             
-            # 建立臨時檔案
-            with tempfile.NamedTemporaryFile(suffix='.mp3', delete=False) as temp_file:
-                temp_file.write(chunk)
-                temp_file_path = temp_file.name
-            
             try:
-                # 使用 Whisper API 轉錄
-                with open(temp_file_path, 'rb') as audio_file:
-                    response = openai.Audio.transcribe(
-                        model="whisper-1",
-                        file=audio_file,
-                        language="zh"  # 指定中文
+                # 建立臨時檔案
+                with tempfile.NamedTemporaryFile(suffix='.mp3', delete=False) as temp_file:
+                    temp_file.write(chunk)
+                    temp_file_path = temp_file.name
+                
+                try:
+                    # 使用本地 Whisper 模型轉錄
+                    result = whisper_model.transcribe(
+                        temp_file_path,
+                        language="zh",  # 中文
+                        task="transcribe",
+                        fp16=False,  # 相容性更好
+                        verbose=False
                     )
+                    
+                    transcription = result["text"].strip()
+                    if transcription:
+                        transcriptions.append(transcription)
+                        logger.info(f"第 {i+1} 個片段轉錄成功: {transcription[:50]}...")
+                    
+                except Exception as e:
+                    logger.error(f"第 {i+1} 個片段 Whisper 轉錄失敗: {e}")
+                    continue
                 
-                transcription = response.text.strip()
-                if transcription:
-                    transcriptions.append(transcription)
-                    logger.info(f"第 {i+1} 個片段轉錄成功: {transcription[:50]}...")
+                finally:
+                    # 清理臨時檔案
+                    try:
+                        os.unlink(temp_file_path)
+                    except:
+                        pass
                 
-            finally:
-                # 清理臨時檔案
-                os.unlink(temp_file_path)
+            except Exception as e:
+                logger.error(f"第 {i+1} 個片段處理失敗: {e}")
+                continue
         
         # 合併所有轉錄結果
         full_transcription = ' '.join(transcriptions)
         logger.info(f"音檔轉錄完成，總長度: {len(full_transcription)} 字元")
         
-        return full_transcription
+        return full_transcription if full_transcription else None
         
     except Exception as e:
-        logger.error(f"Whisper API 轉錄失敗: {e}")
+        logger.error(f"本地 Whisper 轉錄失敗: {e}")
         return None
 
 
@@ -424,7 +447,7 @@ def handle_text_message(event):
 4. 輸入 /end 儲存到試算表
 
 ✨ 支援功能：
-• 語音轉文字（使用 Whisper AI）
+• 語音轉文字（使用本地 Whisper Large v2）
 • 大音檔自動分割處理
 • 即時對話累積
 • Google Sheets 自動儲存"""
@@ -483,11 +506,11 @@ def handle_audio_message(event):
         # 先回覆處理中訊息
         line_bot_api.reply_message(
             event.reply_token,
-            TextSendMessage(text="🎤 正在處理語音訊息，請稍候...\n\n⏳ 使用 Whisper AI 轉錄中...")
+            TextSendMessage(text="🎤 正在處理語音訊息，請稍候...\n\n⏳ 使用本地 Whisper AI 轉錄中...")
         )
         
-        # 使用 Whisper API 轉錄
-        transcription = transcribe_audio_with_whisper(audio_data)
+        # 使用本地 Whisper 模型轉錄
+        transcription = transcribe_audio_with_local_whisper(audio_data)
         
         if transcription:
             # 加入對話記錄
