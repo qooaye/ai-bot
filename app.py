@@ -61,7 +61,7 @@ def load_whisper_model():
             return None
 
 # 在應用啟動時不立即加載模型，等到需要時再加載
-logger.info("應用啟動成功，將在首次語音轉錄時加載 Whisper 模型")憑證
+logger.info("應用啟動成功，將在首次語音轉錄時加載 Whisper 模型")
 
 # 用戶狀態管理
 user_sessions = {}
