@@ -47,7 +47,14 @@ def initialize_google_sheets():
         if GOOGLE_CREDENTIALS_BASE64:
             try:
                 import base64
-                credentials_json = base64.b64decode(GOOGLE_CREDENTIALS_BASE64).decode('utf-8')
+                # 修正 Base64 padding 問題
+                base64_data = GOOGLE_CREDENTIALS_BASE64
+                # 確保 Base64 字串有正確的 padding
+                missing_padding = len(base64_data) % 4
+                if missing_padding:
+                    base64_data += '=' * (4 - missing_padding)
+                
+                credentials_json = base64.b64decode(base64_data).decode('utf-8')
                 credentials_info = json.loads(credentials_json)
                 
                 credentials = ServiceAccountCredentials.from_service_account_info(
@@ -66,12 +73,39 @@ def initialize_google_sheets():
         # 方法2: 使用分離的環境變數（備用方法）
         if not credentials and GOOGLE_SERVICE_ACCOUNT_EMAIL and GOOGLE_PRIVATE_KEY:
             try:
+                # 處理私鑰格式 - 確保正確的換行符
+                private_key = GOOGLE_PRIVATE_KEY.strip()
+                
+                # 如果私鑰沒有正確的開始和結束標記，添加它們
+                if not private_key.startswith('-----BEGIN PRIVATE KEY-----'):
+                    private_key = '-----BEGIN PRIVATE KEY-----\n' + private_key
+                if not private_key.endswith('-----END PRIVATE KEY-----'):
+                    private_key = private_key + '\n-----END PRIVATE KEY-----'
+                
+                # 確保私鑰格式正確
+                lines = private_key.split('\n')
+                formatted_lines = []
+                for line in lines:
+                    line = line.strip()
+                    if line:
+                        formatted_lines.append(line)
+                
+                # 重新組裝私鑰，確保每64個字符一行（除了標記行）
+                formatted_key = formatted_lines[0] + '\n'  # BEGIN 行
+                key_content = ''.join(formatted_lines[1:-1])  # 移除 BEGIN 和 END 行
+                
+                # 將密鑰內容分成64字符一行
+                for i in range(0, len(key_content), 64):
+                    formatted_key += key_content[i:i+64] + '\n'
+                
+                formatted_key += formatted_lines[-1]  # END 行
+                
                 # 建立服務帳戶憑證
                 credentials_info = {
                     "type": "service_account",
                     "project_id": "linebot001-466022",
                     "private_key_id": "a0301f6ea64f12f2ffdbfdb0eabc0c4745858df5",
-                    "private_key": GOOGLE_PRIVATE_KEY,
+                    "private_key": formatted_key,
                     "client_email": GOOGLE_SERVICE_ACCOUNT_EMAIL,
                     "client_id": "113724152426372985072",
                     "auth_uri": "https://accounts.google.com/o/oauth2/auth",
@@ -92,6 +126,8 @@ def initialize_google_sheets():
                 
             except Exception as e:
                 logger.error(f"分離環境變數憑證初始化失敗: {e}")
+                logger.error(f"私鑰長度: {len(GOOGLE_PRIVATE_KEY) if GOOGLE_PRIVATE_KEY else 0}")
+                logger.error(f"私鑰前50字符: {GOOGLE_PRIVATE_KEY[:50] if GOOGLE_PRIVATE_KEY else 'None'}")
                 credentials = None
         
         if not credentials:
