@@ -30,41 +30,78 @@ except Exception as e:
 
 # Google Sheets 設定
 GOOGLE_SHEETS_ID = os.getenv('GOOGLE_SHEETS_ID')
+GOOGLE_CREDENTIALS_BASE64 = os.getenv('GOOGLE_CREDENTIALS_BASE64')
 GOOGLE_SERVICE_ACCOUNT_EMAIL = os.getenv('GOOGLE_SERVICE_ACCOUNT_EMAIL')
 GOOGLE_PRIVATE_KEY = os.getenv('GOOGLE_PRIVATE_KEY', '').replace('\\n', '\n')
 
 def initialize_google_sheets():
-    """初始化 Google Sheets 連接 - 使用環境變數中的服務帳戶憑證"""
+    """初始化 Google Sheets 連接 - 支援多種憑證設定方式"""
     try:
-        if not all([GOOGLE_SHEETS_ID, GOOGLE_SERVICE_ACCOUNT_EMAIL, GOOGLE_PRIVATE_KEY]):
-            logger.error("缺少必要的 Google Sheets 環境變數")
+        if not GOOGLE_SHEETS_ID:
+            logger.error("缺少 GOOGLE_SHEETS_ID 環境變數")
             return None
         
-        # 建立服務帳戶憑證
-        credentials_info = {
-            "type": "service_account",
-            "project_id": "your-project-id",  # 這個可以是任意值，不影響功能
-            "private_key_id": "key-id",
-            "private_key": GOOGLE_PRIVATE_KEY,
-            "client_email": GOOGLE_SERVICE_ACCOUNT_EMAIL,
-            "client_id": "",
-            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-            "token_uri": "https://oauth2.googleapis.com/token",
-            "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
-            "client_x509_cert_url": f"https://www.googleapis.com/robot/v1/metadata/x509/{GOOGLE_SERVICE_ACCOUNT_EMAIL}"
-        }
+        credentials = None
         
-        credentials = ServiceAccountCredentials.from_service_account_info(
-            credentials_info,
-            scopes=[
-                "https://www.googleapis.com/auth/spreadsheets",
-                "https://www.googleapis.com/auth/drive"
-            ]
-        )
+        # 方法1: 使用 Base64 編碼的完整憑證檔案（推薦）
+        if GOOGLE_CREDENTIALS_BASE64:
+            try:
+                import base64
+                credentials_json = base64.b64decode(GOOGLE_CREDENTIALS_BASE64).decode('utf-8')
+                credentials_info = json.loads(credentials_json)
+                
+                credentials = ServiceAccountCredentials.from_service_account_info(
+                    credentials_info,
+                    scopes=[
+                        "https://www.googleapis.com/auth/spreadsheets",
+                        "https://www.googleapis.com/auth/drive"
+                    ]
+                )
+                logger.info("使用 Base64 憑證初始化 Google Sheets 連接成功")
+                
+            except Exception as e:
+                logger.error(f"Base64 憑證解析失敗: {e}")
+                credentials = None
+        
+        # 方法2: 使用分離的環境變數（備用方法）
+        if not credentials and GOOGLE_SERVICE_ACCOUNT_EMAIL and GOOGLE_PRIVATE_KEY:
+            try:
+                # 建立服務帳戶憑證
+                credentials_info = {
+                    "type": "service_account",
+                    "project_id": "linebot001-466022",
+                    "private_key_id": "a0301f6ea64f12f2ffdbfdb0eabc0c4745858df5",
+                    "private_key": GOOGLE_PRIVATE_KEY,
+                    "client_email": GOOGLE_SERVICE_ACCOUNT_EMAIL,
+                    "client_id": "113724152426372985072",
+                    "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                    "token_uri": "https://oauth2.googleapis.com/token",
+                    "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+                    "client_x509_cert_url": f"https://www.googleapis.com/robot/v1/metadata/x509/{GOOGLE_SERVICE_ACCOUNT_EMAIL.replace('@', '%40')}",
+                    "universe_domain": "googleapis.com"
+                }
+                
+                credentials = ServiceAccountCredentials.from_service_account_info(
+                    credentials_info,
+                    scopes=[
+                        "https://www.googleapis.com/auth/spreadsheets",
+                        "https://www.googleapis.com/auth/drive"
+                    ]
+                )
+                logger.info("使用分離環境變數初始化 Google Sheets 連接成功")
+                
+            except Exception as e:
+                logger.error(f"分離環境變數憑證初始化失敗: {e}")
+                credentials = None
+        
+        if not credentials:
+            logger.error("無法建立 Google Sheets 憑證 - 請檢查環境變數設定")
+            return None
         
         client = gspread.authorize(credentials)
         logger.info("Google Sheets 連接初始化成功")
         return client
+        
     except Exception as e:
         logger.error(f"Google Sheets 初始化失敗: {e}")
         return None
