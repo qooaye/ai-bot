@@ -677,10 +677,13 @@ def analyze_image_with_ai(image_data):
     # 將圖片轉換為 Base64
     base64_image = base64.b64encode(image_data).decode('utf-8')
     
+    # 檢查 OpenAI 客戶端狀態
+    logger.info(f"OpenAI 客戶端狀態: {'已初始化' if openai_client else '未初始化'}")
+    
     # 優先使用 OpenAI GPT-4o
     if openai_client:
         try:
-            logger.info("使用 OpenAI GPT-4o 分析圖片")
+            logger.info("使用 OpenAI GPT-4o-mini 分析圖片...")
             response = openai_client.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=[
@@ -701,6 +704,8 @@ def analyze_image_with_ai(image_data):
             )
             
             response_text = response.choices[0].message.content.strip()
+            logger.info(f"OpenAI 原始回應: {response_text[:200]}")
+            
             # 清除 Markdown code block 標記
             if "```json" in response_text:
                 response_text = response_text.split("```json")[1].split("```")[0].strip()
@@ -713,10 +718,12 @@ def analyze_image_with_ai(image_data):
             
         except Exception as e:
             logger.error(f"OpenAI 圖片分析失敗: {e}")
+            return "圖片筆記", f"圖片分析錯誤: {str(e)[:80]}"
     
-    # 如果 OpenAI 不可用，返回預設值
-    logger.warning("無可用的視覺 AI 模型")
-    return "圖片筆記", "無法分析圖片內容 (缺少視覺 AI 模型)"
+    # 如果 OpenAI 不可用
+    api_key_exists = bool(os.getenv('OPENAI_API_KEY'))
+    logger.warning(f"無可用的視覺 AI 模型 (OPENAI_API_KEY 存在: {api_key_exists})")
+    return "圖片筆記", "無法分析圖片內容 (請確認 OPENAI_API_KEY 環境變數)"
 
 
 def save_to_notion(content, summary, note_type, url=None):
