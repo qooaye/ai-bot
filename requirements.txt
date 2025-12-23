@@ -12,3 +12,4 @@ ffmpeg-python==0.2.0
 openai
 groq
 google-api-python-client
+importlib-metadata

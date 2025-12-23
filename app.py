@@ -518,6 +518,8 @@ def upload_to_google_drive(file_data, file_name):
         
     except Exception as e:
         logger.error(f"Google Drive 上傳失敗: {e}")
+        if "storageQuotaExceeded" in str(e):
+            return "QUOTA_ERROR"
         return None
 
 
@@ -533,38 +535,55 @@ def analyze_image_with_ai(image_data):
         # 將圖片轉換為 Base64
         base64_image = base64.b64encode(image_data).decode('utf-8')
         
-        completion = groq_client.chat.completions.create(
-            model="llama-3.2-90b-vision-preview",
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": "請幫我分析這張圖片內容。請回覆一個簡單的 json 格式，包含兩個欄位：'title' (適合作為筆記標題，15字以內) 與 'summary' (一段詳細的內容摘要，約 100 字以內)。請只回覆 JSON 字串，不要有其他文字。"},
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:image/jpeg;base64,{base64_image}",
-                            },
-                        },
-                    ],
-                }
-            ],
-            temperature=0.1,
-        )
+        # 嘗試模型列表 (由新到舊/備用)
+        models_to_try = [
+            "llama-3.2-11b-vision-preview",
+            "llama-3.2-90b-vision-preview",
+            "llava-v1.5-7b-4096-preview"
+        ]
         
-        response_text = completion.choices[0].message.content.strip()
-        # 清除 Markdown code block 標記
-        if "```json" in response_text:
-            response_text = response_text.split("```json")[1].split("```")[0].strip()
-        elif "```" in response_text:
-            response_text = response_text.split("```")[1].split("```")[0].strip()
-            
-        data = json.loads(response_text)
-        return data.get('title', '新圖片筆記'), data.get('summary', '無摘要')
+        last_error = None
+        for model_name in models_to_try:
+            try:
+                logger.info(f"嘗試使用模型分析圖片: {model_name}")
+                completion = groq_client.chat.completions.create(
+                    model=model_name,
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": "請幫我分析這張圖片內容。請回覆一個簡單的 json 格式，包含兩個欄位：'title' (適合作為筆記標題，15字以內) 與 'summary' (一段詳細的內容摘要，約 100 字以內)。請只回覆 JSON 字串，不要有其他文字。"},
+                                {
+                                    "type": "image_url",
+                                    "image_url": {
+                                        "url": f"data:image/jpeg;base64,{base64_image}",
+                                    },
+                                },
+                            ],
+                        }
+                    ],
+                    temperature=0.1,
+                )
+                
+                response_text = completion.choices[0].message.content.strip()
+                # 清除 Markdown code block 標記
+                if "```json" in response_text:
+                    response_text = response_text.split("```json")[1].split("```")[0].strip()
+                elif "```" in response_text:
+                    response_text = response_text.split("```")[1].split("```")[0].strip()
+                    
+                data = json.loads(response_text)
+                return data.get('title', '新圖片筆記'), data.get('summary', '無摘要')
+            except Exception as model_err:
+                logger.warning(f"模型 {model_name} 分析失敗: {model_err}")
+                last_error = model_err
+                continue
+        
+        raise last_error if last_error else Exception("所有視覺模型均失效")
         
     except Exception as e:
-        logger.error(f"AI 圖片分析失敗: {e}")
-        return "圖片筆記", "圖片分析發生錯誤"
+        logger.error(f"AI 圖片分析最終失敗: {e}")
+        return "圖片筆記", f"圖片分析發生錯誤: {str(e)[:100]}"
 
 
 def save_to_notion(content, summary, note_type, url=None):
@@ -976,11 +995,14 @@ def handle_image_message(event):
         # 5. 儲存到 Notion
         notion_saved = save_to_notion(title, summary, "圖片筆記", drive_url)
         
-        # 6. 回傳結果
-        notion_status = "✅ 已同步至 Notion" if notion_saved else "⚠️ Notion 同步失敗"
-        drive_status = f"📂 [雲端連結]({drive_url})" if drive_url else "❌ 雲端上傳失敗"
-        
-        result_text = f"🖼️ 圖片分析完成！\n\n📌 標題：{title}\n🔍 摘要：\n{summary}\n\n🔗 {drive_status}\n{notion_status}"
+        if drive_url == "QUOTA_ERROR":
+            drive_status = "❌ 雲端空間不足 (服務帳戶限制)"
+            notion_status = "✅ 已同步至 Notion (無圖片連結)"
+            result_text = f"🖼️ 圖片分析完成！\n\n📌 標題：{title}\n🔍 摘要：\n{summary}\n\n⚠️ {drive_status}\n{notion_status}\n💡 提示：請將雲端資料夾移動至『共用雲端硬碟』，或檢查空間。"
+        else:
+            drive_status = f"📂 [雲端連結]({drive_url})" if drive_url else "❌ 雲端上傳失敗"
+            notion_status = "✅ 已同步至 Notion" if notion_saved else "⚠️ Notion 同步失敗"
+            result_text = f"🖼️ 圖片分析完成！\n\n📌 標題：{title}\n🔍 摘要：\n{summary}\n\n🔗 {drive_status}\n{notion_status}"
         
         line_bot_api.push_message(
             user_id,
