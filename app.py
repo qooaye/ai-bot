@@ -15,6 +15,7 @@ from datetime import datetime
 import json
 import tempfile
 from openai import OpenAI
+from groq import Groq
 try:
     import whisper
     import torch
@@ -51,8 +52,17 @@ if os.getenv('OPENAI_API_KEY'):
         logger.info("OpenAI 客戶端初始化成功")
     except Exception as e:
         logger.error(f"OpenAI 客戶端初始化失敗: {e}")
+
+# Groq 客戶端初始化
+groq_client = None
+if os.getenv('GROQ_API_KEY'):
+    try:
+        groq_client = Groq(api_key=os.getenv('GROQ_API_KEY'))
+        logger.info("Groq 客戶端初始化成功")
+    except Exception as e:
+        logger.error(f"Groq 客戶端初始化失敗: {e}")
 else:
-    logger.warning("未偵測到 OPENAI_API_KEY，將無法使用線上 Whisper API")
+    logger.warning("未偵測到 GROQ_API_KEY，將無法使用 Groq Whisper API")
 
 # 本地 Whisper 模型設定 (自動選擇適合的模型大小)
 # 優先使用小模型以適應雲端部署環境
@@ -287,6 +297,48 @@ def split_audio_for_whisper(audio_data, chunk_size_mb=50):
     except Exception as e:
         logger.error(f"音檔分割失敗: {e}")
         return [audio_data]  # 分割失敗，返回原檔案
+
+
+def transcribe_audio_with_groq(audio_data):
+    """
+    使用 Groq Whisper API 轉錄音檔
+    速度極快，目前提供免費額度
+    """
+    if not groq_client:
+        logger.error("Groq 客戶端未初始化，無法使用 Groq 轉錄")
+        return None
+
+    try:
+        with tempfile.NamedTemporaryFile(suffix='.mp3', delete=False) as temp_file:
+            temp_file.write(audio_data)
+            temp_file_path = temp_file.name
+        
+        try:
+            with open(temp_file_path, "rb") as audio_file:
+                # 使用 whisper-large-v3 模型
+                transcription = groq_client.audio.transcriptions.create(
+                    model="whisper-large-v3", 
+                    file=audio_file,
+                    language="zh",  # 指定中文
+                    response_format="text"
+                )
+            
+            result_text = transcription.strip()
+            logger.info(f"Groq 轉錄成功: {result_text[:50]}...")
+            return result_text
+            
+        except Exception as e:
+            logger.error(f"Groq API 呼叫失敗: {e}")
+            return None
+        finally:
+            try:
+                os.unlink(temp_file_path)
+            except:
+                pass
+                
+    except Exception as e:
+        logger.error(f"Groq 轉錄過程發生錯誤: {e}")
+        return None
 
 
 def transcribe_audio_with_openai(audio_data):
@@ -543,7 +595,7 @@ def handle_text_message(event):
 4. 輸入 /end 儲存到試算表
 
 ✨ 支援功能：
-• 語音助理（使用 OpenAI Whisper API）
+• 語音助理（使用 Groq Whisper API - 免費極速）
 • 自動記錄到 Google Sheets
 • 即時對話累積內容
 • 支援語音轉文字並立即回傳
@@ -599,18 +651,26 @@ def handle_audio_message(event):
         except Exception as e:
             logger.error(f"回覆處理中訊息失敗: {e}")
 
-        # 3. 執行轉錄 (優先使用 OpenAI)
+        # 3. 執行轉錄 (優先使用 Groq)
         transcription = None
-        if openai_client:
-            transcription = transcribe_audio_with_openai(audio_data)
+        engine_name = ""
         
-        # 如果 OpenAI 失敗或未設定，嘗試本地轉錄（備援）
+        if groq_client:
+            logger.info("嘗試使用 Groq Whisper 進行轉錄...")
+            transcription = transcribe_audio_with_groq(audio_data)
+            engine_name = "Groq Whisper"
+        
+        # 如果 Groq 失敗或未設定，嘗試使用 OpenAI (需付費)
+        if not transcription and openai_client:
+            logger.info("嘗試使用 OpenAI Whisper 進行轉錄...")
+            transcription = transcribe_audio_with_openai(audio_data)
+            engine_name = "OpenAI Whisper"
+        
+        # 最後備援：嘗試本地轉錄
         if not transcription:
             logger.info("嘗試使用本地 Whisper 進行備援轉錄...")
             transcription = transcribe_audio_with_local_whisper(audio_data)
             engine_name = "本地 Whisper AI"
-        else:
-            engine_name = "OpenAI Whisper"
 
         # 4. 處理轉錄結果
         if transcription:
@@ -623,7 +683,7 @@ def handle_audio_message(event):
                 # 一般助理模式：直接回傳
                 result_text = f"🎤 語音助理辨識結果：\n\n{transcription}\n\n💡 提示：輸入 /save 可開啟會議記錄模式並儲存到試算表。"
         else:
-            result_text = "❌ 語音辨識失敗，請重新發送或檢查 OpenAI API 金鑰設定。"
+            result_text = "❌ 語音辨識失敗。原因可能是 API 額度用盡或伺服器繁忙，請稍後再試。"
 
         # 5. 推送結果（使用 push_message）
         line_bot_api.push_message(
