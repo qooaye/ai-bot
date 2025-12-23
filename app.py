@@ -27,6 +27,9 @@ from groq import Groq
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 import base64
+from google_auth_oauthlib.flow import InstalledAppFlow
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials as UserCredentials
 
 try:
     import whisper
@@ -39,6 +42,16 @@ except ImportError:
 
 from pydub import AudioSegment
 import io
+
+# 修正 google-api-python-client 在 Python 3.9 下的相容性問題
+try:
+    from importlib import metadata
+except ImportError:
+    import importlib_metadata as metadata
+
+if not hasattr(metadata, 'packages_distributions'):
+    import importlib_metadata
+    metadata.packages_distributions = importlib_metadata.packages_distributions
 
 app = Flask(__name__)
 
@@ -249,6 +262,102 @@ def initialize_google_sheets():
     except Exception as e:
         logger.error(f"Google Sheets 初始化失敗: {e}")
         return None
+
+def save_token_to_sheets(token_json):
+    """將 OAuth Token 存入 Google Sheets 以便跨部署維持登入"""
+    try:
+        client = initialize_google_sheets()
+        if not client: return
+        
+        spreadsheet = client.open_by_key(os.getenv('GOOGLE_SHEETS_ID'))
+        try:
+            worksheet = spreadsheet.worksheet("OAuthToken")
+        except gspread.exceptions.WorksheetNotFound:
+            worksheet = spreadsheet.add_worksheet(title="OAuthToken", rows=10, cols=2)
+            worksheet.update('A1', [['TokenContent']])
+            
+        worksheet.update('A2', [[json.dumps(token_json)]])
+        logger.info("OAuth Token 已成功存入 Google Sheets")
+    except Exception as e:
+        logger.error(f"儲存 Token 至 Google Sheets 失敗: {e}")
+
+def load_token_from_sheets():
+    """從 Google Sheets 讀取 OAuth Token"""
+    try:
+        client = initialize_google_sheets()
+        if not client: return None
+        
+        spreadsheet = client.open_by_key(os.getenv('GOOGLE_SHEETS_ID'))
+        try:
+            worksheet = spreadsheet.worksheet("OAuthToken")
+            val = worksheet.acell('A2').value
+            if val:
+                return json.loads(val)
+        except Exception:
+            pass
+        return None
+    except Exception as e:
+        logger.error(f"從 Google Sheets 讀取 Token 失敗: {e}")
+        return None
+
+def get_google_drive_service():
+    """獲取 Google Drive 服務 (使用 OAuth 2.0)"""
+    scopes = ["https://www.googleapis.com/auth/drive"]
+    creds = None
+    
+    # 1. 優先嘗試讀取本地 token.json (適合本機測試)
+    if os.path.exists('token.json'):
+        try:
+            creds = UserCredentials.from_authorized_user_file('token.json', scopes)
+            logger.info("已從本地 token.json 載入憑證")
+        except Exception as e:
+            logger.error(f"從本地 token.json 載入失敗: {e}")
+
+    # 2. 嘗試從單獨的環境變數讀取 (轉移自截圖中的設定)
+    if not creds or not creds.valid:
+        refresh_token = os.getenv('GOOGLE_REFRESH_TOKEN')
+        client_id = os.getenv('GOOGLE_CLIENT_ID')
+        client_secret = os.getenv('GOOGLE_CLIENT_SECRET')
+        
+        if refresh_token and client_id and client_secret:
+            try:
+                creds = UserCredentials(
+                    token=None,
+                    refresh_token=refresh_token,
+                    token_uri="https://oauth2.googleapis.com/token",
+                    client_id=client_id,
+                    client_secret=client_secret,
+                    scopes=scopes
+                )
+                logger.info("已從單獨環境變數載入憑證")
+            except Exception as e:
+                logger.error(f"從單獨環境變數載入失敗: {e}")
+
+    # 3. 從 Google Sheets 讀取 (適合雲端部署持久化)
+    if not creds or not creds.valid:
+        token_info = load_token_from_sheets()
+        if token_info:
+            creds = UserCredentials.from_authorized_user_info(token_info, scopes)
+            logger.info("已從 Google Sheets 載入憑證")
+        
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            try:
+                creds.refresh(Request())
+                save_token_to_sheets(json.loads(creds.to_json()))
+                if os.access('.', os.W_OK): # 如果環境允許寫入，更新本地檔
+                    with open('token.json', 'w') as token:
+                        token.write(creds.to_json())
+            except Exception as e:
+                logger.error(f"Token 刷新失敗: {e}")
+                creds = None
+        else:
+            logger.warning("需要 Google Drive 重新授權")
+            return "NEEDS_AUTH"
+            
+    if creds:
+        return build('drive', 'v3', credentials=creds, static_discovery=False)
+    return None
 
 
 def get_user_session(user_id):
@@ -471,60 +580,20 @@ def save_to_notion(content, summary, note_type):
 
 def upload_to_google_drive(file_data, file_name):
     """
-    將檔案上傳到 Google Drive 並取得公開分享連結
-    支援直接上傳或透過 GAS 代理上傳 (解決 Service Account 配額問題)
+    將檔案上傳到 Google Drive 並取得公開分享連結 (使用 OAuth 2.0)
     """
-    gas_url = os.getenv('GOOGLE_DRIVE_GAS_URL')
-    folder_id = os.getenv('GOOGLE_DRIVE_FOLDER_ID')
+    service = get_google_drive_service()
     
-    # 優先嘗試使用 GAS 代理上傳 (推薦用於個人帳號)
-    if gas_url:
-        try:
-            import requests
-            base64_content = base64.b64encode(file_data).decode('utf-8')
-            payload = {
-                "base64": base64_content,
-                "filename": file_name,
-                "mimetype": "image/jpeg",
-                "folderId": folder_id
-            }
-            logger.info(f"嘗試透過 GAS 代理上傳圖片: {gas_url}")
-            response = requests.post(gas_url, json=payload, timeout=30)
-            if response.status_code == 200:
-                result = response.json()
-                if result.get("success"):
-                    logger.info("GAS 代理上傳成功")
-                    return result.get("url")
-                else:
-                    logger.error(f"GAS 代理傳回錯誤: {result.get('error')}")
-            else:
-                logger.error(f"GAS 請求失敗 (狀態碼 {response.status_code})")
-        except Exception as gas_e:
-            logger.error(f"GAS 代理上傳過程出錯: {gas_e}")
-            # 繼續嘗試直接上傳作為備援
+    if service == "NEEDS_AUTH":
+        logger.error("Google Drive 需要授權，請使用 /auth_url 獲取連結")
+        return "NEEDS_AUTH"
+    
+    if not service:
+        logger.error("無法取得 Google Drive 服務")
+        return None
 
-    # 備援：直接使用 Service Account 上傳
     try:
-        # 重新初始化 Google Drive API
-        base64_data = os.getenv('GOOGLE_CREDENTIALS_BASE64')
-        if not base64_data:
-            logger.error("缺少 GOOGLE_CREDENTIALS_BASE64")
-            return None
-            
-        missing_padding = len(base64_data) % 4
-        if missing_padding:
-            base64_data += '=' * (4 - missing_padding)
-        
-        credentials_json = base64.b64decode(base64_data).decode('utf-8')
-        credentials_info = json.loads(credentials_json)
-        
-        creds = ServiceAccountCredentials.from_service_account_info(
-            credentials_info,
-            scopes=["https://www.googleapis.com/auth/drive"]
-        )
-        
-        service = build('drive', 'v3', credentials=creds, static_discovery=False)
-        
+        folder_id = os.getenv('GOOGLE_DRIVE_FOLDER_ID')
         file_metadata = {'name': file_name}
         if folder_id:
             file_metadata['parents'] = [folder_id]
@@ -533,18 +602,69 @@ def upload_to_google_drive(file_data, file_name):
         file = service.files().create(body=file_metadata, media_body=media, fields='id').execute()
         file_id = file.get('id')
         
+        # 設定為公開讀取
         service.permissions().create(
             fileId=file_id,
             body={'type': 'anyone', 'role': 'viewer'}
         ).execute()
         
+        # 取得直接下載連結
         return f"https://drive.google.com/uc?id={file_id}"
         
     except Exception as e:
-        logger.error(f"Google Drive 上傳直接失敗: {e}")
-        if "storageQuotaExceeded" in str(e):
-            return "QUOTA_ERROR"
+        logger.error(f"Google Drive OAuth 上傳失敗: {e}")
         return None
+
+def get_google_auth_url():
+    """產生 Google OAuth 授權連結"""
+    try:
+        base64_data = os.getenv('GOOGLE_OAUTH_CREDENTIALS_BASE64')
+        if not base64_data:
+            return "缺少 GOOGLE_OAUTH_CREDENTIALS_BASE64 環境變數"
+            
+        missing_padding = len(base64_data) % 4
+        if missing_padding:
+            base64_data += '=' * (4 - missing_padding)
+        
+        credentials_json = base64.b64decode(base64_data).decode('utf-8')
+        credentials_info = json.loads(credentials_json)
+        
+        flow = InstalledAppFlow.from_client_config(
+            credentials_info,
+            scopes=["https://www.googleapis.com/auth/drive"]
+        )
+        flow.redirect_uri = "urn:ietf:wg:oauth:2.0:oob"
+        auth_url, _ = flow.authorization_url(prompt='consent')
+        return auth_url
+    except Exception as e:
+        return f"產生授權網址失敗: {e}"
+
+def complete_google_auth(code):
+    """使用授權碼完成授權過程"""
+    try:
+        base64_data = os.getenv('GOOGLE_OAUTH_CREDENTIALS_BASE64')
+        if not base64_data:
+            return "缺少 GOOGLE_OAUTH_CREDENTIALS_BASE64"
+            
+        missing_padding = len(base64_data) % 4
+        if missing_padding:
+            base64_data += '=' * (4 - missing_padding)
+        
+        credentials_json = base64.b64decode(base64_data).decode('utf-8')
+        credentials_info = json.loads(credentials_json)
+        
+        flow = InstalledAppFlow.from_client_config(
+            credentials_info,
+            scopes=["https://www.googleapis.com/auth/drive"]
+        )
+        flow.redirect_uri = "urn:ietf:wg:oauth:2.0:oob"
+        flow.fetch_token(code=code)
+        
+        creds = flow.credentials
+        save_token_to_sheets(json.loads(creds.to_json()))
+        return "✅ 授權成功！圖片助手已就緒。"
+    except Exception as e:
+        return f"❌ 授權失敗: {e}"
 
 
 def analyze_image_with_ai(image_data):
@@ -560,12 +680,10 @@ def analyze_image_with_ai(image_data):
         base64_image = base64.b64encode(image_data).decode('utf-8')
         
         # 嘗試模型列表 (依序嘗試)
+        # 註：2025年 Llama 3.2 已退役，改用 Llama 4 系列
         models_to_try = [
-            "llama-3.2-11b-vision-preview",
-            "llama-3.2-90b-vision-preview",
-            "llama-3.2-11b-vision",
-            "llama-3.2-90b-vision",
-            "llava-v1.5-7b-4096-preview"
+            "meta-llama/llama-4-scout-17b-16e-instruct",
+            "meta-llama/llama-4-maverick-17b-128e-instruct"
         ]
         
         last_error = None
@@ -831,11 +949,23 @@ def handle_text_message(event):
         
         logger.info(f"收到文字訊息 - 用戶: {user_id}, 訊息: {message_text[:100]}...")
         
-        # 取得用戶會話和顯示名稱
+        # 處理用戶會話和顯示名稱
         session = get_user_session(user_id)
         user_name = get_user_display_name(user_id)
         
-        # 處理指令
+        # 處理 OAuth 授權指令 (最高優先權)
+        if message_text.startswith("/auth "):
+            code = message_text.split("/auth ")[1].strip()
+            result = complete_google_auth(code)
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=result))
+            return
+
+        if message_text == "/auth_url":
+            url = get_google_auth_url()
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"🔑 請點擊連結進行 Google Drive 授權：\n\n{url}\n\n授權完成後，請回覆：\n/auth 您的授權碼"))
+            return
+
+        # 處理會議記錄指令
         if message_text == '/save':
             session.start_recording()
             reply_text = "🎙️ 開始會議記錄模式！\n\n現在您可以：\n📝 發送文字訊息\n🎤 發送語音訊息\n\n所有內容都會累積顯示，輸入 /end 結束並儲存到 Google Sheets。"
@@ -868,7 +998,13 @@ def handle_text_message(event):
 🎙️ /save - 開始會議記錄模式
 ⏹️ /end - 結束記錄並儲存到 Google Sheets
 📊 /status - 查看目前記錄狀態
+🖼️ 傳送圖片 - AI 分析、產生摘要並存入 Notion
+🔑 /auth_url - 重新取得 Google Drive 授權連結
 📖 /help - 顯示此說明
+
+💡 本機器人支援：
+1. **會議記錄**：自動彙整文字與語音。
+2. **AI 圖片助手**：自動讀取圖片內容、產生摘要，並上傳至 Google Drive 與 Notion 存檔。"""
 
 💡 使用方式：
 1. 輸入 /save 開始記錄
@@ -1021,7 +1157,11 @@ def handle_image_message(event):
         # 5. 儲存到 Notion
         notion_saved = save_to_notion(title, summary, "圖片筆記", drive_url)
         
-        if drive_url == "QUOTA_ERROR":
+        if drive_url == "NEEDS_AUTH":
+            drive_status = "❌ 需要授權"
+            auth_url = get_google_auth_url()
+            result_text = f"🖼️ 圖片分析完成，但上傳失敗。\n\n📌 標題：{title}\n\n🔐 原因：Google Drive 需要重新授權。\n請點擊連結授權並回傳授權碼：\n{auth_url}\n\n回傳格式：/auth 您的授權碼"
+        elif drive_url == "QUOTA_ERROR":
             drive_status = "❌ 雲端空間不足 (服務帳戶限制)"
             notion_status = "✅ 已同步至 Notion (無圖片連結)"
             result_text = f"🖼️ 圖片分析完成！\n\n📌 標題：{title}\n🔍 摘要：\n{summary}\n\n⚠️ {drive_status}\n{notion_status}\n💡 提示：請將雲端資料夾移動至『共用雲端硬碟』，或檢查空間。"
