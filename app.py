@@ -496,7 +496,7 @@ def upload_to_google_drive(file_data, file_name):
             scopes=["https://www.googleapis.com/auth/drive"]
         )
         
-        service = build('drive', 'v3', credentials=creds)
+        service = build('drive', 'v3', credentials=creds, static_discovery=False)
         
         folder_id = os.getenv('GOOGLE_DRIVE_FOLDER_ID')
         file_metadata = {'name': file_name}
@@ -534,7 +534,7 @@ def analyze_image_with_ai(image_data):
         base64_image = base64.b64encode(image_data).decode('utf-8')
         
         completion = groq_client.chat.completions.create(
-            model="llama-3.2-11b-vision-preview",
+            model="llama-3.2-90b-vision-preview",
             messages=[
                 {
                     "role": "user",
