@@ -56,13 +56,16 @@ if not hasattr(metadata, 'packages_distributions'):
 app = Flask(__name__)
 
 # Line Bot 設定
+line_bot_api = None
+handler = None
+
 try:
     line_bot_api = LineBotApi(os.getenv('CHANNEL_ACCESS_TOKEN'))
     handler = WebhookHandler(os.getenv('CHANNEL_SECRET'))
     logger.info("Line Bot API 初始化成功")
 except Exception as e:
     logger.error(f"Line Bot API 初始化失敗: {e}")
-    raise
+    logger.warning("應用程式將在沒有 LINE Bot 功能的情況下啟動")
 
 # OpenAI 客戶端初始化
 openai_client = None
@@ -680,10 +683,10 @@ def analyze_image_with_ai(image_data):
         base64_image = base64.b64encode(image_data).decode('utf-8')
         
         # 嘗試模型列表 (依序嘗試)
-        # 註：2025年 Llama 3.2 已退役，改用 Llama 4 系列
+        # 使用 Groq 支援的視覺模型
         models_to_try = [
-            "meta-llama/llama-4-scout-17b-16e-instruct",
-            "meta-llama/llama-4-maverick-17b-128e-instruct"
+            "llama-3.2-11b-vision-preview",
+            "llama-3.2-90b-vision-preview"
         ]
         
         last_error = None
@@ -892,6 +895,10 @@ def save_message_to_sheets(user_id, user_name, message_text):
     except Exception as e:
         logger.error(f"儲存到 Google Sheets 失敗: {e}")
         return False
+        
+    except Exception as e:
+        logger.error(f"儲存到 Google Sheets 失敗: {e}")
+        return False
 
 
 @app.route("/health", methods=['GET'])
@@ -919,6 +926,10 @@ def health_check():
 @app.route("/callback", methods=['POST'])
 def callback():
     """LINE Bot webhook callback"""
+    if not handler or not line_bot_api:
+        logger.error("LINE Bot 未正確初始化")
+        abort(500)
+        
     try:
         signature = request.headers.get('X-Line-Signature', '')
         body = request.get_data(as_text=True)
@@ -940,7 +951,6 @@ def callback():
         abort(500)
 
 
-@handler.add(MessageEvent, message=TextMessage)
 def handle_text_message(event):
     """處理文字訊息事件"""
     try:
@@ -1003,8 +1013,8 @@ def handle_text_message(event):
 📖 /help - 顯示此說明
 
 💡 本機器人支援：
-1. **會議記錄**：自動彙整文字與語音。
-2. **AI 圖片助手**：自動讀取圖片內容、產生摘要，並上傳至 Google Drive 與 Notion 存檔。"""
+1. **會議記錄**：自動彙整文字與語音
+2. **AI 圖片助手**：自動讀取圖片內容、產生摘要，並上傳至 Google Drive 與 Notion 存檔
 
 💡 使用方式：
 1. 輸入 /save 開始記錄
@@ -1014,11 +1024,10 @@ def handle_text_message(event):
 
 ✨ 支援功能：
 • 語音助理（使用 Groq Whisper API）
-• 圖片助手（AI 讀圖、上傳 Drive、同步 Notion）(NEW!)
+• 圖片助手（AI 讀圖、上傳 Drive、同步 Notion）
 • AI 自動摘要與 Notion 同步
 • 自動記錄到 Google Sheets (會議模式)
-• 支援語音轉文字並立即回傳
-"""
+• 支援語音轉文字並立即回傳"""
         
         else:
             # 一般文字訊息
@@ -1051,7 +1060,6 @@ def handle_text_message(event):
             pass
 
 
-@handler.add(MessageEvent, message=AudioMessage)
 def handle_audio_message(event):
     """處理語音訊息事件"""
     try:
@@ -1129,7 +1137,6 @@ def handle_audio_message(event):
             pass
 
 
-@handler.add(MessageEvent, message=ImageMessage)
 def handle_image_message(event):
     """處理圖片訊息事件"""
     try:
@@ -1186,7 +1193,6 @@ def handle_image_message(event):
             pass
 
 
-@handler.add(MessageEvent)
 def handle_other_message(event):
     """處理其他類型訊息（圖片、貼圖等）"""
     try:
@@ -1204,6 +1210,17 @@ def handle_other_message(event):
         
     except Exception as e:
         logger.error(f"處理其他訊息時發生錯誤: {e}")
+
+
+# 註冊事件處理器（只有在 handler 初始化成功時才註冊）
+if handler:
+    handler.add(MessageEvent, message=TextMessage)(handle_text_message)
+    handler.add(MessageEvent, message=AudioMessage)(handle_audio_message)
+    handler.add(MessageEvent, message=ImageMessage)(handle_image_message)
+    handler.add(MessageEvent)(handle_other_message)
+    logger.info("LINE Bot 事件處理器註冊成功")
+else:
+    logger.warning("LINE Bot handler 未初始化，跳過事件處理器註冊")
 
 
 if __name__ == "__main__":
