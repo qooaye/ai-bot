@@ -672,17 +672,17 @@ def complete_google_auth(code):
 
 def analyze_image_with_ai(image_data):
     """
-    使用 Groq Llava 或 OpenAI GPT-4o 讀取圖片
+    使用 Groq Llama 4 Scout 或 OpenAI GPT-4o 讀取圖片
     """
     # 將圖片轉換為 Base64
     base64_image = base64.b64encode(image_data).decode('utf-8')
     
-    # 優先使用 Groq Llava（免費）
+    # 優先使用 Groq Llama 4 Scout（免費，支援視覺）
     if groq_client:
         try:
-            logger.info("使用 Groq llava-v1.5-7b-4096-preview 分析圖片...")
+            logger.info("使用 Groq Llama 4 Scout 分析圖片...")
             response = groq_client.chat.completions.create(
-                model="llava-v1.5-7b-4096-preview",
+                model="meta-llama/llama-4-scout-17b-16e-instruct",
                 messages=[
                     {
                         "role": "user",
@@ -701,7 +701,7 @@ def analyze_image_with_ai(image_data):
             )
             
             response_text = response.choices[0].message.content.strip()
-            logger.info(f"Groq Llava 原始回應: {response_text[:200]}")
+            logger.info(f"Groq Llama 4 原始回應: {response_text[:200]}")
             
             # 清除 Markdown code block 標記
             if "```json" in response_text:
@@ -711,7 +711,7 @@ def analyze_image_with_ai(image_data):
             
             try:
                 data = json.loads(response_text)
-                logger.info(f"Groq Llava 圖片分析成功: {data.get('title', '')}")
+                logger.info(f"Groq Llama 4 圖片分析成功: {data.get('title', '')}")
                 return data.get('title', '新圖片筆記'), data.get('summary', '無摘要')
             except json.JSONDecodeError:
                 # 如果 JSON 解析失敗，直接使用回應文字作為摘要
@@ -719,7 +719,7 @@ def analyze_image_with_ai(image_data):
                 return "圖片筆記", response_text[:200]
             
         except Exception as e:
-            logger.error(f"Groq Llava 圖片分析失敗: {e}")
+            logger.error(f"Groq Llama 4 圖片分析失敗: {e}")
     
     # 備援：使用 OpenAI GPT-4o（需付費）
     if openai_client:
