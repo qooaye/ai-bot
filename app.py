@@ -608,7 +608,7 @@ def upload_to_google_drive(file_data, file_name):
         # 設定為公開讀取
         service.permissions().create(
             fileId=file_id,
-            body={'type': 'anyone', 'role': 'viewer'}
+            body={'type': 'anyone', 'role': 'reader'}
         ).execute()
         
         # 取得直接下載連結
@@ -672,65 +672,51 @@ def complete_google_auth(code):
 
 def analyze_image_with_ai(image_data):
     """
-    使用 Groq Vision 模型或 OpenAI GPT-4o 讀取圖片
+    使用 OpenAI GPT-4o 讀取圖片（Groq 視覺模型已停用）
     """
-    if not groq_client:
-        logger.warning("未偵測到 Groq 客戶端，無法進行圖片分析")
-        return "圖片筆記", "無法分析圖片內容 (缺少 API Key)"
-
-    try:
-        # 將圖片轉換為 Base64
-        base64_image = base64.b64encode(image_data).decode('utf-8')
-        
-        # 嘗試模型列表 (依序嘗試)
-        # 使用 Groq 支援的視覺模型
-        models_to_try = [
-            "llama-3.2-11b-vision-preview",
-            "llama-3.2-90b-vision-preview"
-        ]
-        
-        last_error = None
-        for model_name in models_to_try:
-            try:
-                logger.info(f"嘗試使用模型分析圖片: {model_name}")
-                completion = groq_client.chat.completions.create(
-                    model=model_name,
-                    messages=[
-                        {
-                            "role": "user",
-                            "content": [
-                                {"type": "text", "text": "請幫我分析這張圖片內容。請回覆一個簡單的 json 格式，包含兩個欄位：'title' (適合作為筆記標題，15字以內) 與 'summary' (一段詳細的內容摘要，約 100 字以內)。請只回覆 JSON 字串，不要有其他文字。"},
-                                {
-                                    "type": "image_url",
-                                    "image_url": {
-                                        "url": f"data:image/jpeg;base64,{base64_image}",
-                                    },
+    # 將圖片轉換為 Base64
+    base64_image = base64.b64encode(image_data).decode('utf-8')
+    
+    # 優先使用 OpenAI GPT-4o
+    if openai_client:
+        try:
+            logger.info("使用 OpenAI GPT-4o 分析圖片")
+            response = openai_client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "請幫我分析這張圖片內容。請回覆一個簡單的 json 格式，包含兩個欄位：'title' (適合作為筆記標題，15字以內) 與 'summary' (一段詳細的內容摘要，約 100 字以內)。請只回覆 JSON 字串，不要有其他文字。"},
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:image/jpeg;base64,{base64_image}",
                                 },
-                            ],
-                        }
-                    ],
-                    temperature=0.1,
-                )
+                            },
+                        ],
+                    }
+                ],
+                max_tokens=300,
+            )
+            
+            response_text = response.choices[0].message.content.strip()
+            # 清除 Markdown code block 標記
+            if "```json" in response_text:
+                response_text = response_text.split("```json")[1].split("```")[0].strip()
+            elif "```" in response_text:
+                response_text = response_text.split("```")[1].split("```")[0].strip()
                 
-                response_text = completion.choices[0].message.content.strip()
-                # 清除 Markdown code block 標記
-                if "```json" in response_text:
-                    response_text = response_text.split("```json")[1].split("```")[0].strip()
-                elif "```" in response_text:
-                    response_text = response_text.split("```")[1].split("```")[0].strip()
-                    
-                data = json.loads(response_text)
-                return data.get('title', '新圖片筆記'), data.get('summary', '無摘要')
-            except Exception as model_err:
-                logger.warning(f"模型 {model_name} 分析失敗: {model_err}")
-                last_error = model_err
-                continue
-        
-        raise last_error if last_error else Exception("所有視覺模型均失效")
-        
-    except Exception as e:
-        logger.error(f"AI 圖片分析最終失敗: {e}")
-        return "圖片筆記", f"圖片分析發生錯誤: {str(e)[:100]}"
+            data = json.loads(response_text)
+            logger.info(f"OpenAI 圖片分析成功: {data.get('title', '')}")
+            return data.get('title', '新圖片筆記'), data.get('summary', '無摘要')
+            
+        except Exception as e:
+            logger.error(f"OpenAI 圖片分析失敗: {e}")
+    
+    # 如果 OpenAI 不可用，返回預設值
+    logger.warning("無可用的視覺 AI 模型")
+    return "圖片筆記", "無法分析圖片內容 (缺少視覺 AI 模型)"
 
 
 def save_to_notion(content, summary, note_type, url=None):
