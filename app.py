@@ -458,11 +458,11 @@ def save_to_notion(content, summary, note_type):
             logger.info(f"Notion 儲存成功：{note_type}")
             return True
         else:
-            logger.error(f"Notion 儲存失敗: {response.text}")
+            logger.error(f"Notion 儲存失敗 (狀態碼: {response.status_code}): {response.text}")
             return False
             
     except Exception as e:
-        logger.error(f"Notion 儲存過程出錯: {e}")
+        logger.error(f"Notion 儲存過程出錯 (Exception): {e}")
         return False
 
 
