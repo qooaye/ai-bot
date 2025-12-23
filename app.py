@@ -472,12 +472,39 @@ def save_to_notion(content, summary, note_type):
 def upload_to_google_drive(file_data, file_name):
     """
     將檔案上傳到 Google Drive 並取得公開分享連結
+    支援直接上傳或透過 GAS 代理上傳 (解決 Service Account 配額問題)
     """
+    gas_url = os.getenv('GOOGLE_DRIVE_GAS_URL')
+    folder_id = os.getenv('GOOGLE_DRIVE_FOLDER_ID')
+    
+    # 優先嘗試使用 GAS 代理上傳 (推薦用於個人帳號)
+    if gas_url:
+        try:
+            import requests
+            base64_content = base64.b64encode(file_data).decode('utf-8')
+            payload = {
+                "base64": base64_content,
+                "filename": file_name,
+                "mimetype": "image/jpeg",
+                "folderId": folder_id
+            }
+            logger.info(f"嘗試透過 GAS 代理上傳圖片: {gas_url}")
+            response = requests.post(gas_url, json=payload, timeout=30)
+            if response.status_code == 200:
+                result = response.json()
+                if result.get("success"):
+                    logger.info("GAS 代理上傳成功")
+                    return result.get("url")
+                else:
+                    logger.error(f"GAS 代理傳回錯誤: {result.get('error')}")
+            else:
+                logger.error(f"GAS 請求失敗 (狀態碼 {response.status_code})")
+        except Exception as gas_e:
+            logger.error(f"GAS 代理上傳過程出錯: {gas_e}")
+            # 繼續嘗試直接上傳作為備援
+
+    # 備援：直接使用 Service Account 上傳
     try:
-        # 取得憑證 (複用 initialize_google_sheets 的邏輯，或者直接從環境變數取得)
-        # 這裡為了簡單起見，我們假設 credentials 已經在 initialize_google_sheets 中處理過
-        # 但 initialize_google_sheets 是用來初始化 gspread 的，我們需要一樣的 credentials
-        
         # 重新初始化 Google Drive API
         base64_data = os.getenv('GOOGLE_CREDENTIALS_BASE64')
         if not base64_data:
@@ -498,7 +525,6 @@ def upload_to_google_drive(file_data, file_name):
         
         service = build('drive', 'v3', credentials=creds, static_discovery=False)
         
-        folder_id = os.getenv('GOOGLE_DRIVE_FOLDER_ID')
         file_metadata = {'name': file_name}
         if folder_id:
             file_metadata['parents'] = [folder_id]
@@ -507,17 +533,15 @@ def upload_to_google_drive(file_data, file_name):
         file = service.files().create(body=file_metadata, media_body=media, fields='id').execute()
         file_id = file.get('id')
         
-        # 設定為公開讀取 (任何知道連結的人)
         service.permissions().create(
             fileId=file_id,
             body={'type': 'anyone', 'role': 'viewer'}
         ).execute()
         
-        # 取得直接下載連結或分享連結
         return f"https://drive.google.com/uc?id={file_id}"
         
     except Exception as e:
-        logger.error(f"Google Drive 上傳失敗: {e}")
+        logger.error(f"Google Drive 上傳直接失敗: {e}")
         if "storageQuotaExceeded" in str(e):
             return "QUOTA_ERROR"
         return None
@@ -535,10 +559,12 @@ def analyze_image_with_ai(image_data):
         # 將圖片轉換為 Base64
         base64_image = base64.b64encode(image_data).decode('utf-8')
         
-        # 嘗試模型列表 (由新到舊/備用)
+        # 嘗試模型列表 (依序嘗試)
         models_to_try = [
             "llama-3.2-11b-vision-preview",
             "llama-3.2-90b-vision-preview",
+            "llama-3.2-11b-vision",
+            "llama-3.2-90b-vision",
             "llava-v1.5-7b-4096-preview"
         ]
         
