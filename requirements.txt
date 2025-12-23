@@ -7,9 +7,6 @@ google-auth-httplib2==0.1.1
 requests==2.31.0
 python-dotenv==1.0.0
 gunicorn==21.2.0
-openai-whisper
 pydub==0.25.1
 ffmpeg-python==0.2.0
-torch
-audioop-lts; python_version >= '3.13'
 openai

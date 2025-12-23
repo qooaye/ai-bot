@@ -15,6 +15,13 @@ from datetime import datetime
 import json
 import tempfile
 from openai import OpenAI
+try:
+    import whisper
+    import torch
+    HAS_LOCAL_WHISPER = True
+except ImportError:
+    HAS_LOCAL_WHISPER = False
+    logger.warning("未偵測到本地 Whisper 或 Torch，將僅使用 OpenAI API 進行轉錄")
 from pydub import AudioSegment
 import io
 
@@ -55,6 +62,11 @@ WHISPER_MODEL_SIZE = os.getenv('WHISPER_MODEL_SIZE', 'tiny')  # 預設使用 tin
 def load_whisper_model():
     """延遲加載 Whisper 模型以優化啟動時間"""
     global whisper_model
+    
+    if not HAS_LOCAL_WHISPER:
+        logger.error("系統未安裝本地 Whisper 套件，無法加載模型")
+        return None
+
     if whisper_model is not None:
         return whisper_model
     
