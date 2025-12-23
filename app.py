@@ -672,15 +672,56 @@ def complete_google_auth(code):
 
 def analyze_image_with_ai(image_data):
     """
-    使用 OpenAI GPT-4o 讀取圖片（Groq 視覺模型已停用）
+    使用 Groq Llava 或 OpenAI GPT-4o 讀取圖片
     """
     # 將圖片轉換為 Base64
     base64_image = base64.b64encode(image_data).decode('utf-8')
     
-    # 檢查 OpenAI 客戶端狀態
-    logger.info(f"OpenAI 客戶端狀態: {'已初始化' if openai_client else '未初始化'}")
+    # 優先使用 Groq Llava（免費）
+    if groq_client:
+        try:
+            logger.info("使用 Groq llava-v1.5-7b-4096-preview 分析圖片...")
+            response = groq_client.chat.completions.create(
+                model="llava-v1.5-7b-4096-preview",
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "請幫我分析這張圖片內容。請回覆一個簡單的 json 格式，包含兩個欄位：'title' (適合作為筆記標題，15字以內) 與 'summary' (一段詳細的內容摘要，約 100 字以內)。請只回覆 JSON 字串，不要有其他文字。"},
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:image/jpeg;base64,{base64_image}",
+                                },
+                            },
+                        ],
+                    }
+                ],
+                max_tokens=300,
+            )
+            
+            response_text = response.choices[0].message.content.strip()
+            logger.info(f"Groq Llava 原始回應: {response_text[:200]}")
+            
+            # 清除 Markdown code block 標記
+            if "```json" in response_text:
+                response_text = response_text.split("```json")[1].split("```")[0].strip()
+            elif "```" in response_text:
+                response_text = response_text.split("```")[1].split("```")[0].strip()
+            
+            try:
+                data = json.loads(response_text)
+                logger.info(f"Groq Llava 圖片分析成功: {data.get('title', '')}")
+                return data.get('title', '新圖片筆記'), data.get('summary', '無摘要')
+            except json.JSONDecodeError:
+                # 如果 JSON 解析失敗，直接使用回應文字作為摘要
+                logger.warning("JSON 解析失敗，使用原始回應")
+                return "圖片筆記", response_text[:200]
+            
+        except Exception as e:
+            logger.error(f"Groq Llava 圖片分析失敗: {e}")
     
-    # 優先使用 OpenAI GPT-4o
+    # 備援：使用 OpenAI GPT-4o（需付費）
     if openai_client:
         try:
             logger.info("使用 OpenAI GPT-4o-mini 分析圖片...")
@@ -704,26 +745,19 @@ def analyze_image_with_ai(image_data):
             )
             
             response_text = response.choices[0].message.content.strip()
-            logger.info(f"OpenAI 原始回應: {response_text[:200]}")
-            
-            # 清除 Markdown code block 標記
             if "```json" in response_text:
                 response_text = response_text.split("```json")[1].split("```")[0].strip()
             elif "```" in response_text:
                 response_text = response_text.split("```")[1].split("```")[0].strip()
                 
             data = json.loads(response_text)
-            logger.info(f"OpenAI 圖片分析成功: {data.get('title', '')}")
             return data.get('title', '新圖片筆記'), data.get('summary', '無摘要')
             
         except Exception as e:
             logger.error(f"OpenAI 圖片分析失敗: {e}")
-            return "圖片筆記", f"圖片分析錯誤: {str(e)[:80]}"
     
-    # 如果 OpenAI 不可用
-    api_key_exists = bool(os.getenv('OPENAI_API_KEY'))
-    logger.warning(f"無可用的視覺 AI 模型 (OPENAI_API_KEY 存在: {api_key_exists})")
-    return "圖片筆記", "無法分析圖片內容 (請確認 OPENAI_API_KEY 環境變數)"
+    logger.warning("無可用的視覺 AI 模型")
+    return "圖片筆記", "無法分析圖片內容 (請確認 API Key)"
 
 
 def save_to_notion(content, summary, note_type, url=None):
