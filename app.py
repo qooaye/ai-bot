@@ -389,6 +389,86 @@ def transcribe_audio_with_openai(audio_data):
         return None
 
 
+def generate_ai_summary(text):
+    """
+    使用 Groq Llama-3 模型生成一段簡短的摘要 (約 50 字以內)
+    """
+    if not groq_client:
+        logger.warning("未偵測到 Groq 客戶端，跳過摘要生成")
+        return text[:50] + "..." if len(text) > 50 else text
+
+    try:
+        prompt = f"請將以下這段筆記內容歸納成一段精簡的摘要（大約 30-50 字），並以第一人稱或重點條列方式呈現。只需回覆摘要文字，不要有額外的問候語：\n\n內容：{text}"
+        
+        completion = groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[
+                {"role": "system", "content": "你是一個專業的筆記秘書，擅長精簡歸納重點。"},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.7,
+            max_tokens=200
+        )
+        
+        summary = completion.choices[0].message.content.strip()
+        logger.info(f"AI 摘要生成成功: {summary[:50]}...")
+        return summary
+    except Exception as e:
+        logger.error(f"AI 摘要生成失敗: {e}")
+        return text[:50] + "..." if len(text) > 50 else text
+
+
+def save_to_notion(content, summary, note_type):
+    """
+    將內容儲存到 Notion 資料庫
+    """
+    notion_token = os.getenv('NOTION_TOKEN')
+    database_id = os.getenv('NOTION_DATABASE_ID')
+    
+    if not notion_token or not database_id:
+        logger.warning("缺少 Notion 設定，跳過儲存功能")
+        return False
+
+    try:
+        import requests
+        url = "https://api.notion.com/v1/pages"
+        headers = {
+            "Authorization": "Bearer " + notion_token,
+            "Content-Type": "application/json",
+            "Notion-Version": "2022-06-28"
+        }
+        
+        data = {
+            "parent": { "database_id": database_id },
+            "properties": {
+                "名稱": {
+                    "title": [{ "text": { "content": content[:1000] } }]  # Title 有長度限制
+                },
+                "內容": {
+                    "rich_text": [{ "text": { "content": content } }]
+                },
+                "摘要": {
+                    "rich_text": [{ "text": { "content": summary } }]
+                },
+                "類型": {
+                    "select": { "name": note_type }
+                }
+            }
+        }
+        
+        response = requests.post(url, headers=headers, json=data)
+        if response.status_code == 200:
+            logger.info(f"Notion 儲存成功：{note_type}")
+            return True
+        else:
+            logger.error(f"Notion 儲存失敗: {response.text}")
+            return False
+            
+    except Exception as e:
+        logger.error(f"Notion 儲存過程出錯: {e}")
+        return False
+
+
 def transcribe_audio_with_local_whisper(audio_data):
     """
     使用本地 Whisper 模型轉錄音檔
@@ -600,7 +680,8 @@ def handle_text_message(event):
 
 ✨ 支援功能：
 • 語音助理（使用 Groq Whisper API - 免費極速）
-• 自動記錄到 Google Sheets
+• AI 自動摘要與 Notion 同步 (NEW!)
+• 自動記錄到 Google Sheets (會議模式)
 • 即時對話累積內容
 • 支援語音轉文字並立即回傳
 """
@@ -610,10 +691,14 @@ def handle_text_message(event):
             if session.is_recording:
                 session.add_message(message_text)
                 conversation_text = session.get_conversation_text()
-                
                 reply_text = f"📝 已記錄文字訊息\n\n💬 目前累積內容:\n\n{conversation_text}\n\n📊 共 {len(session.conversation_buffer)} 條記錄 | 輸入 /end 結束並儲存"
             else:
-                reply_text = f"收到您的訊息：{message_text}\n\n💡 提示：輸入 /save 開始會議記錄模式，或輸入 /help 查看使用說明。"
+                # 非錄音模式：自動執行 AI 摘要並存入 Notion
+                summary = generate_ai_summary(message_text)
+                notion_saved = save_to_notion(message_text, summary, "文字筆記")
+                
+                notion_status = "✅ 已同步至 Notion" if notion_saved else "⚠️ Notion 同步失敗 (請檢查金鑰)"
+                reply_text = f"📝 已收到筆記\n\n🔍 AI 摘要：\n{summary}\n\n{notion_status}"
         
         # 回覆訊息
         line_bot_api.reply_message(
@@ -684,8 +769,12 @@ def handle_audio_message(event):
                 conversation_text = session.get_conversation_text()
                 result_text = f"✅ 【{engine_name}】辨識成功！\n\n📝 內容：\n{transcription}\n\n💬 目前累積完整內容：\n\n{conversation_text}\n\n📊 輸入 /end 結束並儲存"
             else:
-                # 一般助理模式：直接回傳
-                result_text = f"🎤 語音助理辨識結果：\n\n{transcription}\n\n💡 提示：輸入 /save 可開啟會議記錄模式並儲存到試算表。"
+                # 一般助理模式：AI 摘要並存入 Notion
+                summary = generate_ai_summary(transcription)
+                notion_saved = save_to_notion(transcription, summary, "語音筆記")
+                
+                notion_status = "✅ 已同步至 Notion" if notion_saved else "⚠️ Notion 同步失敗"
+                result_text = f"🎤 語音助理辨識結果：\n\n{transcription}\n\n🔍 AI 摘要：\n{summary}\n\n{notion_status}\n\n💡 提示：輸入 /save 可開啟會議記錄模式。"
         else:
             result_text = "❌ 語音辨識失敗。原因可能是 API 額度用盡或伺服器繁忙，請稍後再試。"
 
