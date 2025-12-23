@@ -4,13 +4,17 @@ from linebot.exceptions import InvalidSignatureError
 from linebot.models import MessageEvent, TextMessage, AudioMessage, TextSendMessage
 import os
 import logging
+from dotenv import load_dotenv
+
+# 載入環境變數
+load_dotenv()
 import gspread
 from google.auth.credentials import Credentials
 from google.oauth2.service_account import Credentials as ServiceAccountCredentials
 from datetime import datetime
 import json
 import tempfile
-import whisper
+from openai import OpenAI
 from pydub import AudioSegment
 import io
 
@@ -31,6 +35,17 @@ try:
 except Exception as e:
     logger.error(f"Line Bot API 初始化失敗: {e}")
     raise
+
+# OpenAI 客戶端初始化
+openai_client = None
+if os.getenv('OPENAI_API_KEY'):
+    try:
+        openai_client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
+        logger.info("OpenAI 客戶端初始化成功")
+    except Exception as e:
+        logger.error(f"OpenAI 客戶端初始化失敗: {e}")
+else:
+    logger.warning("未偵測到 OPENAI_API_KEY，將無法使用線上 Whisper API")
 
 # 本地 Whisper 模型設定 (自動選擇適合的模型大小)
 # 優先使用小模型以適應雲端部署環境
@@ -262,6 +277,50 @@ def split_audio_for_whisper(audio_data, chunk_size_mb=50):
         return [audio_data]  # 分割失敗，返回原檔案
 
 
+def transcribe_audio_with_openai(audio_data):
+    """
+    使用 OpenAI Whisper API 轉錄音檔
+    準確度極高，支援多種語言
+    """
+    if not openai_client:
+        logger.error("OpenAI 客戶端未初始化，無法使用線上轉錄")
+        return None
+
+    try:
+        # OpenAI API 對單個檔案有限制（25MB），但 LINE 語音訊息通常很小
+        # 如果需要處理超大檔案，這裡可以再加入分割邏輯
+        
+        with tempfile.NamedTemporaryFile(suffix='.mp3', delete=False) as temp_file:
+            temp_file.write(audio_data)
+            temp_file_path = temp_file.name
+        
+        try:
+            with open(temp_file_path, "rb") as audio_file:
+                transcription = openai_client.audio.transcriptions.create(
+                    model="whisper-1", 
+                    file=audio_file,
+                    language="zh",  # 指定中文
+                    response_format="text"
+                )
+            
+            result_text = transcription.strip()
+            logger.info(f"OpenAI 轉錄成功: {result_text[:50]}...")
+            return result_text
+            
+        except Exception as e:
+            logger.error(f"OpenAI API 呼叫失敗: {e}")
+            return None
+        finally:
+            try:
+                os.unlink(temp_file_path)
+            except:
+                pass
+                
+    except Exception as e:
+        logger.error(f"OpenAI 轉錄過程發生錯誤: {e}")
+        return None
+
+
 def transcribe_audio_with_local_whisper(audio_data):
     """
     使用本地 Whisper 模型轉錄音檔
@@ -472,10 +531,11 @@ def handle_text_message(event):
 4. 輸入 /end 儲存到試算表
 
 ✨ 支援功能：
-• 語音轉文字（使用本地 Whisper AI）
-• 大音檔自動分割處理
-• 即時對話累積
-• Google Sheets 自動儲存"""
+• 語音助理（使用 OpenAI Whisper API）
+• 自動記錄到 Google Sheets
+• 即時對話累積內容
+• 支援語音轉文字並立即回傳
+"""
         
         else:
             # 一般文字訊息
@@ -509,45 +569,51 @@ def handle_audio_message(event):
     """處理語音訊息事件"""
     try:
         user_id = event.source.user_id
-        
         logger.info(f"收到語音訊息 - 用戶: {user_id}")
         
-        # 取得用戶會話和顯示名稱
+        # 取得用戶會話
         session = get_user_session(user_id)
-        user_name = get_user_display_name(user_id)
         
-        if not session.is_recording:
-            reply_text = "🎤 收到語音訊息！\n\n💡 提示：輸入 /save 開始會議記錄模式，語音將自動轉為文字並累積顯示。\n\n或輸入 /help 查看使用說明。"
-            line_bot_api.reply_message(
-                event.reply_token,
-                TextSendMessage(text=reply_text)
-            )
-            return
-        
-        # 下載音檔
+        # 1. 下載音檔
         message_content = line_bot_api.get_message_content(event.message.id)
         audio_data = message_content.content
         
-        # 先回覆處理中訊息
-        line_bot_api.reply_message(
-            event.reply_token,
-            TextSendMessage(text="🎤 正在處理語音訊息，請稍候...\n\n⏳ 使用本地 Whisper AI 轉錄中...")
-        )
+        # 2. 先回覆處理中訊息（使用 reply_token）
+        try:
+            line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(text="🎤 收到語音，正在辨識中...")
+            )
+        except Exception as e:
+            logger.error(f"回覆處理中訊息失敗: {e}")
+
+        # 3. 執行轉錄 (優先使用 OpenAI)
+        transcription = None
+        if openai_client:
+            transcription = transcribe_audio_with_openai(audio_data)
         
-        # 使用本地 Whisper 模型轉錄
-        transcription = transcribe_audio_with_local_whisper(audio_data)
-        
-        if transcription:
-            # 加入對話記錄
-            session.add_message(f"[語音] {transcription}")
-            conversation_text = session.get_conversation_text()
-            
-            # 推送結果訊息
-            result_text = f"🎤 語音轉錄完成！\n\n📝 轉錄內容:\n{transcription}\n\n💬 目前累積內容:\n\n{conversation_text}\n\n📊 共 {len(session.conversation_buffer)} 條記錄 | 輸入 /end 結束並儲存"
+        # 如果 OpenAI 失敗或未設定，嘗試本地轉錄（備援）
+        if not transcription:
+            logger.info("嘗試使用本地 Whisper 進行備援轉錄...")
+            transcription = transcribe_audio_with_local_whisper(audio_data)
+            engine_name = "本地 Whisper AI"
         else:
-            result_text = "❌ 語音轉錄失敗，請重新發送或檢查音檔格式。"
-        
-        # 推送結果（因為已經回覆過，這裡使用 push_message）
+            engine_name = "OpenAI Whisper"
+
+        # 4. 處理轉錄結果
+        if transcription:
+            if session.is_recording:
+                # 錄音模式：累積內容
+                session.add_message(f"[語音] {transcription}")
+                conversation_text = session.get_conversation_text()
+                result_text = f"✅ 【{engine_name}】辨識成功！\n\n📝 內容：\n{transcription}\n\n💬 目前累積完整內容：\n\n{conversation_text}\n\n📊 輸入 /end 結束並儲存"
+            else:
+                # 一般助理模式：直接回傳
+                result_text = f"🎤 語音助理辨識結果：\n\n{transcription}\n\n💡 提示：輸入 /save 可開啟會議記錄模式並儲存到試算表。"
+        else:
+            result_text = "❌ 語音辨識失敗，請重新發送或檢查 OpenAI API 金鑰設定。"
+
+        # 5. 推送結果（使用 push_message）
         line_bot_api.push_message(
             user_id,
             TextSendMessage(text=result_text)
@@ -558,7 +624,7 @@ def handle_audio_message(event):
         try:
             line_bot_api.push_message(
                 user_id,
-                TextSendMessage(text="❌ 語音處理失敗，請稍後再試。")
+                TextSendMessage(text="❌ 語音處理發生伺服器錯誤，請檢查設定。")
             )
         except:
             pass
