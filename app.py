@@ -442,10 +442,7 @@ def save_to_notion(content, summary, note_type):
             "parent": { "database_id": database_id },
             "properties": {
                 "名稱": {
-                    "title": [{ "text": { "content": content[:1000] } }]  # Title 有長度限制
-                },
-                "內容": {
-                    "rich_text": [{ "text": { "content": content } }]
+                    "title": [{ "text": { "content": content[:2000] } }]  # Notion Title 上限約 2000 字
                 },
                 "摘要": {
                     "rich_text": [{ "text": { "content": summary } }]
