@@ -6,8 +6,16 @@ import os
 import logging
 from dotenv import load_dotenv
 
+# 設定日誌記錄
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
 # 載入環境變數
 load_dotenv()
+
 import gspread
 from google.auth.credentials import Credentials
 from google.oauth2.service_account import Credentials as ServiceAccountCredentials
@@ -16,22 +24,18 @@ import json
 import tempfile
 from openai import OpenAI
 from groq import Groq
+
 try:
     import whisper
     import torch
     HAS_LOCAL_WHISPER = True
 except ImportError:
     HAS_LOCAL_WHISPER = False
-    logger.warning("未偵測到本地 Whisper 或 Torch，將僅使用 OpenAI API 進行轉錄")
+    # 這裡現在可以使用 logger 了
+    logger.warning("未偵測到本地 Whisper 或 Torch，將僅使用 OpenAI/Groq API 進行轉錄")
+
 from pydub import AudioSegment
 import io
-
-# 設定日誌記錄
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
