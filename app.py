@@ -1,7 +1,7 @@
 from flask import Flask, request, abort, jsonify
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
-from linebot.models import MessageEvent, TextMessage, AudioMessage, TextSendMessage
+from linebot.models import MessageEvent, TextMessage, AudioMessage, ImageMessage, TextSendMessage
 import os
 import logging
 from dotenv import load_dotenv
@@ -24,6 +24,9 @@ import json
 import tempfile
 from openai import OpenAI
 from groq import Groq
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseUpload
+import base64
 
 try:
     import whisper
@@ -466,6 +469,159 @@ def save_to_notion(content, summary, note_type):
         return False
 
 
+def upload_to_google_drive(file_data, file_name):
+    """
+    將檔案上傳到 Google Drive 並取得公開分享連結
+    """
+    try:
+        # 取得憑證 (複用 initialize_google_sheets 的邏輯，或者直接從環境變數取得)
+        # 這裡為了簡單起見，我們假設 credentials 已經在 initialize_google_sheets 中處理過
+        # 但 initialize_google_sheets 是用來初始化 gspread 的，我們需要一樣的 credentials
+        
+        # 重新初始化 Google Drive API
+        base64_data = os.getenv('GOOGLE_CREDENTIALS_BASE64')
+        if not base64_data:
+            logger.error("缺少 GOOGLE_CREDENTIALS_BASE64")
+            return None
+            
+        missing_padding = len(base64_data) % 4
+        if missing_padding:
+            base64_data += '=' * (4 - missing_padding)
+        
+        credentials_json = base64.b64decode(base64_data).decode('utf-8')
+        credentials_info = json.loads(credentials_json)
+        
+        creds = ServiceAccountCredentials.from_service_account_info(
+            credentials_info,
+            scopes=["https://www.googleapis.com/auth/drive"]
+        )
+        
+        service = build('drive', 'v3', credentials=creds)
+        
+        folder_id = os.getenv('GOOGLE_DRIVE_FOLDER_ID')
+        file_metadata = {'name': file_name}
+        if folder_id:
+            file_metadata['parents'] = [folder_id]
+            
+        media = MediaIoBaseUpload(io.BytesIO(file_data), mimetype='image/jpeg', resumable=True)
+        file = service.files().create(body=file_metadata, media_body=media, fields='id').execute()
+        file_id = file.get('id')
+        
+        # 設定為公開讀取 (任何知道連結的人)
+        service.permissions().create(
+            fileId=file_id,
+            body={'type': 'anyone', 'role': 'viewer'}
+        ).execute()
+        
+        # 取得直接下載連結或分享連結
+        return f"https://drive.google.com/uc?id={file_id}"
+        
+    except Exception as e:
+        logger.error(f"Google Drive 上傳失敗: {e}")
+        return None
+
+
+def analyze_image_with_ai(image_data):
+    """
+    使用 Groq Vision 模型或 OpenAI GPT-4o 讀取圖片
+    """
+    if not groq_client:
+        logger.warning("未偵測到 Groq 客戶端，無法進行圖片分析")
+        return "圖片筆記", "無法分析圖片內容 (缺少 API Key)"
+
+    try:
+        # 將圖片轉換為 Base64
+        base64_image = base64.b64encode(image_data).decode('utf-8')
+        
+        completion = groq_client.chat.completions.create(
+            model="llama-3.2-11b-vision-preview",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "請幫我分析這張圖片內容。請回覆一個簡單的 json 格式，包含兩個欄位：'title' (適合作為筆記標題，15字以內) 與 'summary' (一段詳細的內容摘要，約 100 字以內)。請只回覆 JSON 字串，不要有其他文字。"},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{base64_image}",
+                            },
+                        },
+                    ],
+                }
+            ],
+            temperature=0.1,
+        )
+        
+        response_text = completion.choices[0].message.content.strip()
+        # 清除 Markdown code block 標記
+        if "```json" in response_text:
+            response_text = response_text.split("```json")[1].split("```")[0].strip()
+        elif "```" in response_text:
+            response_text = response_text.split("```")[1].split("```")[0].strip()
+            
+        data = json.loads(response_text)
+        return data.get('title', '新圖片筆記'), data.get('summary', '無摘要')
+        
+    except Exception as e:
+        logger.error(f"AI 圖片分析失敗: {e}")
+        return "圖片筆記", "圖片分析發生錯誤"
+
+
+def save_to_notion(content, summary, note_type, url=None):
+    """
+    將內容儲存到 Notion 資料庫，支援 URL
+    """
+    notion_token = os.getenv('NOTION_TOKEN')
+    database_id = os.getenv('NOTION_DATABASE_ID')
+    
+    if not notion_token or not database_id:
+        logger.warning("缺少 Notion 設定，跳過儲存功能")
+        return False
+
+    try:
+        import requests
+        api_url = "https://api.notion.com/v1/pages"
+        headers = {
+            "Authorization": "Bearer " + notion_token,
+            "Content-Type": "application/json",
+            "Notion-Version": "2022-06-28"
+        }
+        
+        properties = {
+            "名稱": {
+                "title": [{ "text": { "content": content[:2000] } }]
+            },
+            "摘要": {
+                "rich_text": [{ "text": { "content": summary } }]
+            },
+            "類型": {
+                "select": { "name": note_type }
+            }
+        }
+        
+        if url:
+            properties["URL"] = {
+                "url": url
+            }
+        
+        data = {
+            "parent": { "database_id": database_id },
+            "properties": properties
+        }
+        
+        response = requests.post(api_url, headers=headers, json=data)
+        if response.status_code == 200:
+            logger.info(f"Notion 儲存成功：{note_type}")
+            return True
+        else:
+            logger.error(f"Notion 儲存失敗 (狀態碼: {response.status_code}): {response.text}")
+            return False
+            
+    except Exception as e:
+        logger.error(f"Notion 儲存過程出錯 (Exception): {e}")
+        return False
+
+
 def transcribe_audio_with_local_whisper(audio_data):
     """
     使用本地 Whisper 模型轉錄音檔
@@ -676,10 +832,10 @@ def handle_text_message(event):
 4. 輸入 /end 儲存到試算表
 
 ✨ 支援功能：
-• 語音助理（使用 Groq Whisper API - 免費極速）
-• AI 自動摘要與 Notion 同步 (NEW!)
+• 語音助理（使用 Groq Whisper API）
+• 圖片助手（AI 讀圖、上傳 Drive、同步 Notion）(NEW!)
+• AI 自動摘要與 Notion 同步
 • 自動記錄到 Google Sheets (會議模式)
-• 即時對話累積內容
 • 支援語音轉文字並立即回傳
 """
         
@@ -787,6 +943,56 @@ def handle_audio_message(event):
             line_bot_api.push_message(
                 user_id,
                 TextSendMessage(text="❌ 語音處理發生伺服器錯誤，請檢查設定。")
+            )
+        except:
+            pass
+
+
+@handler.add(MessageEvent, message=ImageMessage)
+def handle_image_message(event):
+    """處理圖片訊息事件"""
+    try:
+        user_id = event.source.user_id
+        logger.info(f"收到圖片訊息 - 用戶: {user_id}")
+        
+        # 1. 回覆處理中
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(text="🖼️ 收到圖片，正在進行 AI 視覺分析與存檔...")
+        )
+        
+        # 2. 下載圖片
+        message_content = line_bot_api.get_message_content(event.message.id)
+        image_data = message_content.content
+        
+        # 3. AI 視覺分析
+        title, summary = analyze_image_with_ai(image_data)
+        
+        # 4. 上傳到 Google Drive
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        file_name = f"image_{timestamp}.jpg"
+        drive_url = upload_to_google_drive(image_data, file_name)
+        
+        # 5. 儲存到 Notion
+        notion_saved = save_to_notion(title, summary, "圖片筆記", drive_url)
+        
+        # 6. 回傳結果
+        notion_status = "✅ 已同步至 Notion" if notion_saved else "⚠️ Notion 同步失敗"
+        drive_status = f"📂 [雲端連結]({drive_url})" if drive_url else "❌ 雲端上傳失敗"
+        
+        result_text = f"🖼️ 圖片分析完成！\n\n📌 標題：{title}\n🔍 摘要：\n{summary}\n\n🔗 {drive_status}\n{notion_status}"
+        
+        line_bot_api.push_message(
+            user_id,
+            TextSendMessage(text=result_text)
+        )
+        
+    except Exception as e:
+        logger.error(f"處理圖片訊息時發生錯誤: {e}")
+        try:
+            line_bot_api.push_message(
+                user_id,
+                TextSendMessage(text="❌ 圖片處理失敗，請稍後再試。")
             )
         except:
             pass
