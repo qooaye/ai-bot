@@ -559,116 +559,90 @@ def is_facebook_url(url):
     return 'facebook.com' in url or 'fb.com' in url or 'fb.watch' in url
 
 
-def fetch_threads_content(url):
+def fetch_with_jina_reader(url):
     """
-    爬取 Threads 貼文內容
+    使用 Jina AI Reader 爬取網頁內容（免費、穩定）
+    支援 Threads、Facebook 等難爬的網站
     """
     try:
+        jina_url = f"https://r.jina.ai/{url}"
         headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-            'Accept-Language': 'zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7',
-            'Accept-Encoding': 'gzip, deflate, br',
+            'Accept': 'text/plain',
+            'User-Agent': 'Mozilla/5.0 (compatible; LineBot/1.0)',
         }
         
-        response = requests.get(url, headers=headers, timeout=15)
+        response = requests.get(jina_url, headers=headers, timeout=30)
         response.raise_for_status()
         response.encoding = 'utf-8'
         
-        soup = BeautifulSoup(response.text, 'lxml')
+        content = response.text.strip()
         
-        # 嘗試從 meta 標籤取得內容
-        content = ""
-        author = ""
-        
-        # 取得作者名稱
-        og_title = soup.find('meta', property='og:title')
-        if og_title:
-            author = og_title.get('content', '').split('(')[0].strip()
-        
-        # 取得貼文內容
-        og_desc = soup.find('meta', property='og:description')
-        if og_desc:
-            content = og_desc.get('content', '')
-        
-        # 備用：從 twitter:description 取得
-        if not content:
-            twitter_desc = soup.find('meta', attrs={'name': 'twitter:description'})
-            if twitter_desc:
-                content = twitter_desc.get('content', '')
-        
-        # 備用：從 description 取得
-        if not content:
-            desc = soup.find('meta', attrs={'name': 'description'})
-            if desc:
-                content = desc.get('content', '')
-        
-        if content:
-            title = f"Threads - {author}" if author else "Threads 貼文"
-            logger.info(f"Threads 爬取成功: {title} ({len(content)} 字)")
-            return title, content, url
-        else:
-            logger.warning("Threads 內容為空")
+        if not content or len(content) < 50:
+            logger.warning(f"Jina Reader 回傳內容過短: {len(content)} 字")
             return None, None, url
-            
-    except Exception as e:
-        logger.error(f"Threads 爬取失敗: {e}")
+        
+        # 從內容中提取標題（Jina 格式通常第一行是標題）
+        lines = content.split('\n')
+        title = lines[0].strip() if lines else "網頁內容"
+        
+        # 移除標題行，保留正文
+        if title.startswith('# '):
+            title = title[2:]
+        if title.startswith('Title: '):
+            title = title[7:]
+        
+        # 清理內容
+        content = '\n'.join(lines[1:]).strip() if len(lines) > 1 else content
+        content = content[:8000]  # 限制長度
+        
+        logger.info(f"Jina Reader 爬取成功: {title[:50]}... ({len(content)} 字)")
+        return title, content, url
+        
+    except requests.exceptions.Timeout:
+        logger.error(f"Jina Reader 超時: {url}")
         return None, None, url
+    except Exception as e:
+        logger.error(f"Jina Reader 爬取失敗: {e}")
+        return None, None, url
+
+
+def fetch_threads_content(url):
+    """
+    爬取 Threads 貼文內容（使用 Jina AI Reader）
+    """
+    title, content, url = fetch_with_jina_reader(url)
+    if title and content:
+        # 調整標題格式
+        if not title.startswith('Threads'):
+            title = f"Threads - {title[:50]}"
+        return title, content, url
+    return None, None, url
 
 
 def fetch_facebook_content(url):
     """
-    爬取 Facebook 貼文內容
+    爬取 Facebook 貼文內容（使用 Jina AI Reader）
     """
-    try:
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-            'Accept-Language': 'zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7',
-        }
-        
-        response = requests.get(url, headers=headers, timeout=15, allow_redirects=True)
-        response.raise_for_status()
-        response.encoding = 'utf-8'
-        
-        soup = BeautifulSoup(response.text, 'lxml')
-        
-        content = ""
-        author = ""
-        
-        # 取得作者/頁面名稱
-        og_title = soup.find('meta', property='og:title')
-        if og_title:
-            author = og_title.get('content', '').split('|')[0].strip()
-        
-        # 取得貼文內容
-        og_desc = soup.find('meta', property='og:description')
-        if og_desc:
-            content = og_desc.get('content', '')
-        
-        # 備用方法
-        if not content:
-            desc = soup.find('meta', attrs={'name': 'description'})
-            if desc:
-                content = desc.get('content', '')
-        
-        if content:
-            title = f"Facebook - {author}" if author else "Facebook 貼文"
-            logger.info(f"Facebook 爬取成功: {title} ({len(content)} 字)")
-            return title, content, url
-        else:
-            logger.warning("Facebook 內容為空，可能需要登入")
-            return None, None, url
-            
-    except Exception as e:
-        logger.error(f"Facebook 爬取失敗: {e}")
-        return None, None, url
+    title, content, url = fetch_with_jina_reader(url)
+    if title and content:
+        # 調整標題格式
+        if not title.startswith('Facebook'):
+            title = f"Facebook - {title[:50]}"
+        return title, content, url
+    return None, None, url
 
 
 def fetch_webpage_content(url):
     """
-    爬取網頁內容，回傳標題和主要文字內容
+    爬取網頁內容，優先使用 Jina AI Reader，失敗則用傳統方式
     """
+    # 先嘗試 Jina AI Reader
+    title, content, url = fetch_with_jina_reader(url)
+    if title and content:
+        return title, content, url
+    
+    # 備援：傳統爬蟲方式
+    logger.info("Jina Reader 失敗，嘗試傳統爬蟲方式...")
     try:
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
