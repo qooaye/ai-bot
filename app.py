@@ -901,7 +901,7 @@ def save_to_notion(content, summary, note_type, url=None):
                 "title": [{ "text": { "content": content[:2000] } }]
             },
             "摘要": {
-                "rich_text": [{ "text": { "content": summary } }]
+                "rich_text": [{ "text": { "content": summary[:2000] } }]
             },
             "類型": {
                 "select": { "name": note_type }
@@ -921,6 +921,133 @@ def save_to_notion(content, summary, note_type, url=None):
         response = requests.post(api_url, headers=headers, json=data)
         if response.status_code == 200:
             logger.info(f"Notion 儲存成功：{note_type}")
+            return True
+        else:
+            logger.error(f"Notion 儲存失敗 (狀態碼: {response.status_code}): {response.text}")
+            return False
+            
+    except Exception as e:
+        logger.error(f"Notion 儲存過程出錯 (Exception): {e}")
+        return False
+
+
+def save_webpage_to_notion(title, summary, url, webpage_content):
+    """
+    將網頁內容儲存到 Notion，包含 Page 內文
+    """
+    notion_token = os.getenv('NOTION_TOKEN')
+    database_id = os.getenv('NOTION_DATABASE_ID')
+    
+    if not notion_token or not database_id:
+        logger.warning("缺少 Notion 設定，跳過儲存功能")
+        return False
+
+    try:
+        import requests
+        api_url = "https://api.notion.com/v1/pages"
+        headers = {
+            "Authorization": "Bearer " + notion_token,
+            "Content-Type": "application/json",
+            "Notion-Version": "2022-06-28"
+        }
+        
+        # 將網頁內容分段（Notion 每個 block 最多 2000 字）
+        def split_content(text, max_len=1800):
+            paragraphs = text.split('\n')
+            chunks = []
+            current_chunk = ""
+            for p in paragraphs:
+                if len(current_chunk) + len(p) + 1 > max_len:
+                    if current_chunk:
+                        chunks.append(current_chunk.strip())
+                    current_chunk = p
+                else:
+                    current_chunk += "\n" + p if current_chunk else p
+            if current_chunk:
+                chunks.append(current_chunk.strip())
+            return chunks[:20]  # 最多 20 個區塊
+        
+        # 建立 children blocks
+        children = []
+        
+        # 加入來源連結
+        children.append({
+            "object": "block",
+            "type": "bookmark",
+            "bookmark": {
+                "url": url
+            }
+        })
+        
+        # 加入分隔線
+        children.append({
+            "object": "block",
+            "type": "divider",
+            "divider": {}
+        })
+        
+        # 加入 AI 摘要標題
+        children.append({
+            "object": "block",
+            "type": "heading_2",
+            "heading_2": {
+                "rich_text": [{"type": "text", "text": {"content": "📝 AI 摘要"}}]
+            }
+        })
+        
+        # 加入摘要內容
+        children.append({
+            "object": "block",
+            "type": "callout",
+            "callout": {
+                "rich_text": [{"type": "text", "text": {"content": summary[:1800]}}],
+                "icon": {"emoji": "💡"}
+            }
+        })
+        
+        # 加入原文標題
+        children.append({
+            "object": "block",
+            "type": "heading_2",
+            "heading_2": {
+                "rich_text": [{"type": "text", "text": {"content": "📄 原文內容"}}]
+            }
+        })
+        
+        # 加入網頁原文內容
+        content_chunks = split_content(webpage_content)
+        for chunk in content_chunks:
+            if chunk.strip():
+                children.append({
+                    "object": "block",
+                    "type": "paragraph",
+                    "paragraph": {
+                        "rich_text": [{"type": "text", "text": {"content": chunk}}]
+                    }
+                })
+        
+        data = {
+            "parent": {"database_id": database_id},
+            "properties": {
+                "名稱": {
+                    "title": [{"text": {"content": title[:2000]}}]
+                },
+                "摘要": {
+                    "rich_text": [{"text": {"content": summary[:2000]}}]
+                },
+                "類型": {
+                    "select": {"name": "網頁筆記"}
+                },
+                "URL": {
+                    "url": url
+                }
+            },
+            "children": children
+        }
+        
+        response = requests.post(api_url, headers=headers, json=data)
+        if response.status_code == 200:
+            logger.info(f"Notion 網頁筆記儲存成功：{title[:30]}")
             return True
         else:
             logger.error(f"Notion 儲存失敗 (狀態碼: {response.status_code}): {response.text}")
@@ -1186,10 +1313,10 @@ def handle_text_message(event):
                     # 生成 AI 摘要
                     summary = generate_webpage_summary(title, content, url)
                     
-                    # 儲存到 Notion（標題用網頁標題，摘要用 AI 生成的）
-                    notion_saved = save_to_notion(title, summary, "網頁筆記", url)
+                    # 儲存到 Notion（包含 Page 內文）
+                    notion_saved = save_webpage_to_notion(title, summary, url, content)
                     
-                    notion_status = "✅ 已同步至 Notion" if notion_saved else "⚠️ Notion 同步失敗"
+                    notion_status = "✅ 已同步至 Notion（含原文）" if notion_saved else "⚠️ Notion 同步失敗"
                     result_text = f"🌐 網頁助手分析完成！\n\n📌 標題：{title[:50]}\n\n🔍 AI 摘要：\n{summary}\n\n{notion_status}"
                 else:
                     result_text = f"❌ 無法爬取網頁內容\n\n可能原因：\n• 網站阻擋爬蟲\n• 網址無效或無法連線\n• 網頁需要登入\n\n請確認網址是否正確。"
