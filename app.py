@@ -551,12 +551,13 @@ def is_url(text):
 
 def is_threads_url(url):
     """檢查是否為 Threads 連結"""
-    return 'threads.net' in url
+    return 'threads.net' in url.lower() or 'threads.com' in url.lower()
 
 
 def is_facebook_url(url):
     """檢查是否為 Facebook 連結"""
-    return 'facebook.com' in url or 'fb.com' in url or 'fb.watch' in url
+    url_lower = url.lower()
+    return 'facebook.com' in url_lower or 'fb.com' in url_lower or 'fb.watch' in url_lower
 
 
 def fetch_with_jina_reader(url):
