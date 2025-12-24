@@ -549,6 +549,122 @@ def is_url(text):
     return url_pattern.match(text) is not None
 
 
+def is_threads_url(url):
+    """檢查是否為 Threads 連結"""
+    return 'threads.net' in url
+
+
+def is_facebook_url(url):
+    """檢查是否為 Facebook 連結"""
+    return 'facebook.com' in url or 'fb.com' in url or 'fb.watch' in url
+
+
+def fetch_threads_content(url):
+    """
+    爬取 Threads 貼文內容
+    """
+    try:
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7',
+            'Accept-Encoding': 'gzip, deflate, br',
+        }
+        
+        response = requests.get(url, headers=headers, timeout=15)
+        response.raise_for_status()
+        response.encoding = 'utf-8'
+        
+        soup = BeautifulSoup(response.text, 'lxml')
+        
+        # 嘗試從 meta 標籤取得內容
+        content = ""
+        author = ""
+        
+        # 取得作者名稱
+        og_title = soup.find('meta', property='og:title')
+        if og_title:
+            author = og_title.get('content', '').split('(')[0].strip()
+        
+        # 取得貼文內容
+        og_desc = soup.find('meta', property='og:description')
+        if og_desc:
+            content = og_desc.get('content', '')
+        
+        # 備用：從 twitter:description 取得
+        if not content:
+            twitter_desc = soup.find('meta', attrs={'name': 'twitter:description'})
+            if twitter_desc:
+                content = twitter_desc.get('content', '')
+        
+        # 備用：從 description 取得
+        if not content:
+            desc = soup.find('meta', attrs={'name': 'description'})
+            if desc:
+                content = desc.get('content', '')
+        
+        if content:
+            title = f"Threads - {author}" if author else "Threads 貼文"
+            logger.info(f"Threads 爬取成功: {title} ({len(content)} 字)")
+            return title, content, url
+        else:
+            logger.warning("Threads 內容為空")
+            return None, None, url
+            
+    except Exception as e:
+        logger.error(f"Threads 爬取失敗: {e}")
+        return None, None, url
+
+
+def fetch_facebook_content(url):
+    """
+    爬取 Facebook 貼文內容
+    """
+    try:
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7',
+        }
+        
+        response = requests.get(url, headers=headers, timeout=15, allow_redirects=True)
+        response.raise_for_status()
+        response.encoding = 'utf-8'
+        
+        soup = BeautifulSoup(response.text, 'lxml')
+        
+        content = ""
+        author = ""
+        
+        # 取得作者/頁面名稱
+        og_title = soup.find('meta', property='og:title')
+        if og_title:
+            author = og_title.get('content', '').split('|')[0].strip()
+        
+        # 取得貼文內容
+        og_desc = soup.find('meta', property='og:description')
+        if og_desc:
+            content = og_desc.get('content', '')
+        
+        # 備用方法
+        if not content:
+            desc = soup.find('meta', attrs={'name': 'description'})
+            if desc:
+                content = desc.get('content', '')
+        
+        if content:
+            title = f"Facebook - {author}" if author else "Facebook 貼文"
+            logger.info(f"Facebook 爬取成功: {title} ({len(content)} 字)")
+            return title, content, url
+        else:
+            logger.warning("Facebook 內容為空，可能需要登入")
+            return None, None, url
+            
+    except Exception as e:
+        logger.error(f"Facebook 爬取失敗: {e}")
+        return None, None, url
+
+
 def fetch_webpage_content(url):
     """
     爬取網頁內容，回傳標題和主要文字內容
@@ -931,7 +1047,7 @@ def save_to_notion(content, summary, note_type, url=None):
         return False
 
 
-def save_webpage_to_notion(title, summary, url, webpage_content):
+def save_webpage_to_notion(title, summary, url, webpage_content, note_type="網頁筆記"):
     """
     將網頁內容儲存到 Notion，包含 Page 內文
     """
@@ -1036,7 +1152,7 @@ def save_webpage_to_notion(title, summary, url, webpage_content):
                     "rich_text": [{"text": {"content": summary[:2000]}}]
                 },
                 "類型": {
-                    "select": {"name": "網頁筆記"}
+                    "select": {"name": note_type}
                 },
                 "URL": {
                     "url": url
@@ -1301,25 +1417,51 @@ def handle_text_message(event):
                 conversation_text = session.get_conversation_text()
                 reply_text = f"📝 已記錄文字訊息\n\n💬 目前累積內容:\n\n{conversation_text}\n\n📊 共 {len(session.conversation_buffer)} 條記錄 | 輸入 /end 結束並儲存"
             elif is_url(message_text):
-                # 網址處理：爬取網頁內容並摘要
-                line_bot_api.reply_message(
-                    event.reply_token,
-                    TextSendMessage(text="🌐 正在爬取網頁內容，請稍候...")
-                )
-                
-                title, content, url = fetch_webpage_content(message_text)
+                # 判斷網址類型並選擇對應的爬取方式
+                if is_threads_url(message_text):
+                    platform = "Threads"
+                    note_type = "Threads 筆記"
+                    line_bot_api.reply_message(
+                        event.reply_token,
+                        TextSendMessage(text="🧵 正在爬取 Threads 貼文，請稍候...")
+                    )
+                    title, content, url = fetch_threads_content(message_text)
+                elif is_facebook_url(message_text):
+                    platform = "Facebook"
+                    note_type = "Facebook 筆記"
+                    line_bot_api.reply_message(
+                        event.reply_token,
+                        TextSendMessage(text="📘 正在爬取 Facebook 貼文，請稍候...")
+                    )
+                    title, content, url = fetch_facebook_content(message_text)
+                else:
+                    platform = "網頁"
+                    note_type = "網頁筆記"
+                    line_bot_api.reply_message(
+                        event.reply_token,
+                        TextSendMessage(text="🌐 正在爬取網頁內容，請稍候...")
+                    )
+                    title, content, url = fetch_webpage_content(message_text)
                 
                 if title and content:
                     # 生成 AI 摘要
                     summary = generate_webpage_summary(title, content, url)
                     
-                    # 儲存到 Notion（包含 Page 內文）
-                    notion_saved = save_webpage_to_notion(title, summary, url, content)
+                    # 儲存到 Notion（包含 Page 內文），使用對應的類型
+                    notion_saved = save_webpage_to_notion(title, summary, url, content, note_type)
                     
                     notion_status = "✅ 已同步至 Notion（含原文）" if notion_saved else "⚠️ Notion 同步失敗"
-                    result_text = f"🌐 網頁助手分析完成！\n\n📌 標題：{title[:50]}\n\n🔍 AI 摘要：\n{summary}\n\n{notion_status}"
+                    
+                    if platform == "Threads":
+                        emoji = "🧵"
+                    elif platform == "Facebook":
+                        emoji = "📘"
+                    else:
+                        emoji = "🌐"
+                    
+                    result_text = f"{emoji} {platform} 助手分析完成！\n\n📌 標題：{title[:50]}\n\n🔍 AI 摘要：\n{summary}\n\n{notion_status}"
                 else:
-                    result_text = f"❌ 無法爬取網頁內容\n\n可能原因：\n• 網站阻擋爬蟲\n• 網址無效或無法連線\n• 網頁需要登入\n\n請確認網址是否正確。"
+                    result_text = f"❌ 無法爬取 {platform} 內容\n\n可能原因：\n• 網站阻擋爬蟲\n• 網址無效或無法連線\n• 貼文需要登入或為私人貼文\n\n請確認網址是否正確。"
                 
                 line_bot_api.push_message(user_id, TextSendMessage(text=result_text))
                 return
