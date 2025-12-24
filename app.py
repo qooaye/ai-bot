@@ -42,6 +42,10 @@ except ImportError:
 
 from pydub import AudioSegment
 import io
+import re
+import requests
+from bs4 import BeautifulSoup
+from urllib.parse import urlparse
 
 # 修正 google-api-python-client 在 Python 3.9 下的相容性問題
 try:
@@ -531,6 +535,118 @@ def generate_ai_summary(text):
     except Exception as e:
         logger.error(f"AI 摘要生成失敗: {e}")
         return text[:50] + "..." if len(text) > 50 else text
+
+
+def is_url(text):
+    """檢查文字是否為網址"""
+    url_pattern = re.compile(
+        r'^https?://'  # http:// or https://
+        r'(?:(?:[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?\.)+[A-Z]{2,6}\.?|'  # domain
+        r'localhost|'  # localhost
+        r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})'  # or ip
+        r'(?::\d+)?'  # optional port
+        r'(?:/?|[/?]\S+)$', re.IGNORECASE)
+    return url_pattern.match(text) is not None
+
+
+def fetch_webpage_content(url):
+    """
+    爬取網頁內容，回傳標題和主要文字內容
+    """
+    try:
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7',
+        }
+        
+        response = requests.get(url, headers=headers, timeout=15)
+        response.raise_for_status()
+        response.encoding = response.apparent_encoding or 'utf-8'
+        
+        soup = BeautifulSoup(response.text, 'lxml')
+        
+        # 移除不需要的元素
+        for element in soup(['script', 'style', 'nav', 'footer', 'header', 'aside', 'iframe', 'noscript']):
+            element.decompose()
+        
+        # 取得標題
+        title = ""
+        if soup.title:
+            title = soup.title.string.strip() if soup.title.string else ""
+        if not title:
+            h1 = soup.find('h1')
+            title = h1.get_text(strip=True) if h1 else urlparse(url).netloc
+        
+        # 取得主要內容
+        # 優先找 article 或 main 標籤
+        main_content = soup.find('article') or soup.find('main') or soup.find('div', class_=re.compile(r'content|article|post|entry'))
+        
+        if main_content:
+            text = main_content.get_text(separator='\n', strip=True)
+        else:
+            # 取得所有段落文字
+            paragraphs = soup.find_all(['p', 'h1', 'h2', 'h3', 'li'])
+            text = '\n'.join([p.get_text(strip=True) for p in paragraphs if len(p.get_text(strip=True)) > 20])
+        
+        # 清理文字
+        text = re.sub(r'\n{3,}', '\n\n', text)  # 移除多餘空行
+        text = text[:8000]  # 限制長度避免 token 過多
+        
+        logger.info(f"網頁爬取成功: {title[:50]}... ({len(text)} 字)")
+        return title, text, url
+        
+    except requests.exceptions.Timeout:
+        logger.error(f"網頁爬取超時: {url}")
+        return None, None, url
+    except requests.exceptions.RequestException as e:
+        logger.error(f"網頁爬取失敗: {e}")
+        return None, None, url
+    except Exception as e:
+        logger.error(f"網頁解析失敗: {e}")
+        return None, None, url
+
+
+def generate_webpage_summary(title, content, url):
+    """
+    使用 AI 生成網頁內容摘要
+    """
+    if not groq_client:
+        logger.warning("未偵測到 Groq 客戶端，跳過摘要生成")
+        return content[:200] + "..." if len(content) > 200 else content
+
+    try:
+        prompt = f"""請閱讀以下網頁內容，並生成一份結構化的摘要：
+
+網頁標題：{title}
+網址：{url}
+
+內容：
+{content[:6000]}
+
+請用繁體中文回覆，格式如下：
+📌 重點摘要（3-5 個要點，每點一行）
+💡 關鍵資訊或數據
+🔗 相關主題標籤（2-3 個）
+
+請直接回覆摘要內容，不要有開場白。"""
+        
+        completion = groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[
+                {"role": "system", "content": "你是一個專業的內容分析師，擅長快速抓取文章重點並生成結構化摘要。"},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.5,
+            max_tokens=800
+        )
+        
+        summary = completion.choices[0].message.content.strip()
+        logger.info(f"網頁摘要生成成功: {summary[:50]}...")
+        return summary
+    except Exception as e:
+        logger.error(f"網頁摘要生成失敗: {e}")
+        return content[:200] + "..." if len(content) > 200 else content
 
 
 def save_to_notion(content, summary, note_type):
@@ -1030,31 +1146,26 @@ def handle_text_message(event):
                 reply_text = "📊 會議記錄狀態：未開始\n\n輸入 /save 開始記錄模式"
         
         elif message_text == '/help':
-            reply_text = """📖 會議記錄小幫手使用說明：
+            reply_text = """📖 智慧筆記助手使用說明：
 
 🎙️ /save - 開始會議記錄模式
 ⏹️ /end - 結束記錄並儲存到 Google Sheets
 📊 /status - 查看目前記錄狀態
-🖼️ 傳送圖片 - AI 分析、產生摘要並存入 Notion
 🔑 /auth_url - 重新取得 Google Drive 授權連結
 📖 /help - 顯示此說明
 
-💡 本機器人支援：
-1. **會議記錄**：自動彙整文字與語音
-2. **AI 圖片助手**：自動讀取圖片內容、產生摘要，並上傳至 Google Drive 與 Notion 存檔
+✨ 支援功能：
+🌐 網頁助手 - 貼上網址自動爬取摘要
+🖼️ 圖片助手 - AI 分析圖片內容
+🎤 語音助理 - 語音轉文字
+📝 文字筆記 - AI 自動摘要
 
 💡 使用方式：
-1. 輸入 /save 開始記錄
-2. 發送語音或文字訊息
-3. 所有內容會累積顯示
-4. 輸入 /end 儲存到試算表
-
-✨ 支援功能：
-• 語音助理（使用 Groq Whisper API）
-• 圖片助手（AI 讀圖、上傳 Drive、同步 Notion）
-• AI 自動摘要與 Notion 同步
-• 自動記錄到 Google Sheets (會議模式)
-• 支援語音轉文字並立即回傳"""
+• 貼上網址 → 自動爬取並摘要到 Notion
+• 傳送圖片 → AI 分析並存入 Notion
+• 傳送語音 → 轉文字並摘要
+• 傳送文字 → AI 摘要並存入 Notion
+• /save → 開始會議記錄模式"""
         
         else:
             # 一般文字訊息
@@ -1062,6 +1173,29 @@ def handle_text_message(event):
                 session.add_message(message_text)
                 conversation_text = session.get_conversation_text()
                 reply_text = f"📝 已記錄文字訊息\n\n💬 目前累積內容:\n\n{conversation_text}\n\n📊 共 {len(session.conversation_buffer)} 條記錄 | 輸入 /end 結束並儲存"
+            elif is_url(message_text):
+                # 網址處理：爬取網頁內容並摘要
+                line_bot_api.reply_message(
+                    event.reply_token,
+                    TextSendMessage(text="🌐 正在爬取網頁內容，請稍候...")
+                )
+                
+                title, content, url = fetch_webpage_content(message_text)
+                
+                if title and content:
+                    # 生成 AI 摘要
+                    summary = generate_webpage_summary(title, content, url)
+                    
+                    # 儲存到 Notion（標題用網頁標題，摘要用 AI 生成的）
+                    notion_saved = save_to_notion(title, summary, "網頁筆記", url)
+                    
+                    notion_status = "✅ 已同步至 Notion" if notion_saved else "⚠️ Notion 同步失敗"
+                    result_text = f"🌐 網頁助手分析完成！\n\n📌 標題：{title[:50]}\n\n🔍 AI 摘要：\n{summary}\n\n{notion_status}"
+                else:
+                    result_text = f"❌ 無法爬取網頁內容\n\n可能原因：\n• 網站阻擋爬蟲\n• 網址無效或無法連線\n• 網頁需要登入\n\n請確認網址是否正確。"
+                
+                line_bot_api.push_message(user_id, TextSendMessage(text=result_text))
+                return
             else:
                 # 非錄音模式：自動執行 AI 摘要並存入 Notion
                 summary = generate_ai_summary(message_text)

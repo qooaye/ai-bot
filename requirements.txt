@@ -13,3 +13,5 @@ openai
 groq
 google-api-python-client
 importlib-metadata
+beautifulsoup4==4.12.2
+lxml==4.9.3
