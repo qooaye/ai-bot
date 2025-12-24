@@ -560,51 +560,58 @@ def is_facebook_url(url):
     return 'facebook.com' in url_lower or 'fb.com' in url_lower or 'fb.watch' in url_lower
 
 
-def fetch_with_jina_reader(url):
+def fetch_with_jina_reader(url, timeout=60):
     """
     使用 Jina AI Reader 爬取網頁內容（免費、穩定）
     支援 Threads、Facebook 等難爬的網站
     """
-    try:
-        jina_url = f"https://r.jina.ai/{url}"
-        headers = {
-            'Accept': 'text/plain',
-            'User-Agent': 'Mozilla/5.0 (compatible; LineBot/1.0)',
-        }
-        
-        response = requests.get(jina_url, headers=headers, timeout=30)
-        response.raise_for_status()
-        response.encoding = 'utf-8'
-        
-        content = response.text.strip()
-        
-        if not content or len(content) < 50:
-            logger.warning(f"Jina Reader 回傳內容過短: {len(content)} 字")
-            return None, None, url
-        
-        # 從內容中提取標題（Jina 格式通常第一行是標題）
-        lines = content.split('\n')
-        title = lines[0].strip() if lines else "網頁內容"
-        
-        # 移除標題行，保留正文
-        if title.startswith('# '):
-            title = title[2:]
-        if title.startswith('Title: '):
-            title = title[7:]
-        
-        # 清理內容
-        content = '\n'.join(lines[1:]).strip() if len(lines) > 1 else content
-        content = content[:8000]  # 限制長度
-        
-        logger.info(f"Jina Reader 爬取成功: {title[:50]}... ({len(content)} 字)")
-        return title, content, url
-        
-    except requests.exceptions.Timeout:
-        logger.error(f"Jina Reader 超時: {url}")
-        return None, None, url
-    except Exception as e:
-        logger.error(f"Jina Reader 爬取失敗: {e}")
-        return None, None, url
+    jina_url = f"https://r.jina.ai/{url}"
+    headers = {
+        'Accept': 'text/plain',
+        'User-Agent': 'Mozilla/5.0 (compatible; LineBot/1.0)',
+        'X-Return-Format': 'text',
+    }
+    
+    # 重試機制
+    for attempt in range(2):
+        try:
+            logger.info(f"Jina Reader 嘗試第 {attempt + 1} 次: {url[:50]}...")
+            response = requests.get(jina_url, headers=headers, timeout=timeout)
+            response.raise_for_status()
+            response.encoding = 'utf-8'
+            
+            content = response.text.strip()
+            
+            if not content or len(content) < 30:
+                logger.warning(f"Jina Reader 回傳內容過短: {len(content)} 字")
+                continue
+            
+            # 從內容中提取標題（Jina 格式通常第一行是標題）
+            lines = content.split('\n')
+            title = lines[0].strip() if lines else "網頁內容"
+            
+            # 移除標題行，保留正文
+            if title.startswith('# '):
+                title = title[2:]
+            if title.startswith('Title: '):
+                title = title[7:]
+            
+            # 清理內容
+            content = '\n'.join(lines[1:]).strip() if len(lines) > 1 else content
+            content = content[:8000]  # 限制長度
+            
+            logger.info(f"Jina Reader 爬取成功: {title[:50]}... ({len(content)} 字)")
+            return title, content, url
+            
+        except requests.exceptions.Timeout:
+            logger.warning(f"Jina Reader 超時 (嘗試 {attempt + 1}): {url}")
+            continue
+        except Exception as e:
+            logger.error(f"Jina Reader 爬取失敗: {e}")
+            continue
+    
+    logger.error(f"Jina Reader 最終失敗: {url}")
+    return None, None, url
 
 
 def fetch_threads_content(url):
